@@ -1,0 +1,6 @@
+{
+  "name": "Projeto Ad Estrelas",
+  "description": "Simulador de engenharia espacial e centro de comando retro 32-bits desenvolvido para o NASA Space Apps Challenge 2026.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

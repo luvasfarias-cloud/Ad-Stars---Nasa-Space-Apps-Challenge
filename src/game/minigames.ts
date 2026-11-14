@@ -1,0 +1,1766 @@
+import {
+  audio,
+  computeMetrics,
+  formatUsd,
+  getMission,
+  LaunchVehicle,
+  SpaceBus,
+  SpaceInstrument,
+  GroundStation
+} from "./data";
+import {
+  getLang,
+  getLocBus,
+  getLocGround,
+  getLocInstrument,
+  getLocVehicle,
+  t
+} from "./i18n";
+import type { TelemetryLaunchRenderer } from "./ps1Renderers";
+
+export interface MinigameState {
+  type: string;
+  score: number;
+  valA: number;
+  valB: number;
+  vel: number;
+  active: boolean;
+  timer: number;
+  errors: number;
+  hits: number;
+  data: Record<string, unknown>;
+}
+
+export const mgState: MinigameState = {
+  type: "IGNITION_SEQUENCE",
+  score: 40,
+  valA: 50,
+  valB: 0,
+  vel: 1,
+  active: false,
+  timer: 0,
+  errors: 0,
+  hits: 0,
+  data: {}
+};
+
+export interface MinigameHooks {
+  appendFlightLog: (msg: string) => void;
+  getVisor3D: () => TelemetryLaunchRenderer | null;
+  completeMissionSuccess: (bonusPct: number, errors?: number) => void;
+  completeMissionFailure: (reason: string) => void;
+  syncFlightTelemetry: () => void;
+  onInspectItem?: (kind: string, itemId: string, missionId: string) => void;
+}
+
+let hooks: MinigameHooks | null = null;
+
+export function initMinigameHooks(h: MinigameHooks) {
+  hooks = h;
+}
+
+function logFlight(msg: string) {
+  hooks?.appendFlightLog(msg);
+}
+
+function shuffleOrder(arr: number[]): number[] {
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+const ASCENT_DURATION = 12.5;
+
+interface SparkParticle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+  color: string;
+  size: number;
+}
+
+interface ShockRing {
+  x: number;
+  y: number;
+  r: number;
+  maxR: number;
+  life: number;
+  maxLife: number;
+  color: string;
+}
+
+const mgSparks: SparkParticle[] = [];
+const mgRings: ShockRing[] = [];
+let mgHitStreak = 0;
+let mgFxDirty = false;
+let lastMgClock = "";
+let lastMgClockClass = "";
+let lastMgBarW = "";
+let lastMgBarClass = "";
+let lastMgBorder = "";
+let lastMgLedL = "";
+let lastMgLedR = "";
+let lastMgCallout = "";
+let lastMgStatus = "";
+
+function clearMgFx() {
+  mgSparks.length = 0;
+  mgRings.length = 0;
+  mgHitStreak = 0;
+  mgFxDirty = false;
+  lastMgClock = "";
+  lastMgClockClass = "";
+  lastMgBarW = "";
+  lastMgBarClass = "";
+  lastMgBorder = "";
+  lastMgLedL = "";
+  lastMgLedR = "";
+  lastMgCallout = "";
+  lastMgStatus = "";
+  const fx = document.getElementById("mg-fx-canvas") as HTMLCanvasElement | null;
+  if (fx) {
+    const ctx = fx.getContext("2d");
+    ctx?.clearRect(0, 0, fx.width, fx.height);
+  }
+}
+
+function triggerMgFeedback(ok: boolean, targetSelector?: string | HTMLElement | null) {
+  const hud = document.getElementById("minigame-hud");
+  const fx = document.getElementById("mg-fx-canvas") as HTMLCanvasElement | null;
+  if (hud) {
+    hud.classList.remove("mg-hit-ok", "mg-hit-err");
+    requestAnimationFrame(() => {
+      hud.classList.add(ok ? "mg-hit-ok" : "mg-hit-err");
+    });
+  }
+  if (ok) mgHitStreak += 1;
+  else mgHitStreak = 0;
+
+  if (!fx) return;
+  const fxRect = fx.getBoundingClientRect();
+  let cx = fx.width * 0.5;
+  let cy = fx.height * 0.62;
+
+  let el: Element | null = null;
+  if (typeof targetSelector === "string") {
+    el = document.querySelector(targetSelector);
+  } else if (targetSelector instanceof HTMLElement) {
+    el = targetSelector;
+  }
+  if (el && fxRect.width > 0 && fxRect.height > 0) {
+    const r = el.getBoundingClientRect();
+    cx = ((r.left + r.width * 0.5 - fxRect.left) / fxRect.width) * fx.width;
+    cy = ((r.top + r.height * 0.5 - fxRect.top) / fxRect.height) * fx.height;
+  }
+
+  const palette = ok
+    ? ["#34d399", "#fbbf24", "#38bdf8", "#ffffff"]
+    : ["#fb7185", "#ef4444", "#fbbf24"];
+  const count = ok ? 18 : 14;
+  for (let i = 0; i < count; i++) {
+    const ang = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.45;
+    const spd = 65 + Math.random() * 145;
+    mgSparks.push({
+      x: cx,
+      y: cy,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd - 30,
+      life: 0.38 + Math.random() * 0.25,
+      maxLife: 0.6,
+      color: palette[i % palette.length],
+      size: ok ? 3 + (i % 3) : 3
+    });
+  }
+  mgRings.push({
+    x: cx,
+    y: cy,
+    r: 4,
+    maxR: ok ? 34 : 26,
+    life: 0.32,
+    maxLife: 0.32,
+    color: ok ? "#34d399" : "#fb7185"
+  });
+  mgFxDirty = true;
+}
+
+function stepAndDrawMgFx(dt: number) {
+  if (!mgFxDirty && mgRings.length === 0 && mgSparks.length === 0) return;
+  const fx = document.getElementById("mg-fx-canvas") as HTMLCanvasElement | null;
+  if (!fx) return;
+  const ctx = fx.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, fx.width, fx.height);
+  if (mgRings.length === 0 && mgSparks.length === 0) {
+    mgFxDirty = false;
+    return;
+  }
+
+  for (let i = mgRings.length - 1; i >= 0; i--) {
+    const ring = mgRings[i];
+    ring.life -= dt;
+    if (ring.life <= 0) {
+      mgRings.splice(i, 1);
+      continue;
+    }
+    const p = 1 - ring.life / ring.maxLife;
+    const rad = ring.r + (ring.maxR - ring.r) * p;
+    ctx.strokeStyle = ring.color;
+    ctx.globalAlpha = Math.max(0, 1 - p);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ring.x, ring.y, rad, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  for (let i = mgSparks.length - 1; i >= 0; i--) {
+    const s = mgSparks[i];
+    s.life -= dt;
+    if (s.life <= 0) {
+      mgSparks.splice(i, 1);
+      continue;
+    }
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.vy += 190 * dt;
+    ctx.globalAlpha = Math.max(0, Math.min(1, s.life / s.maxLife));
+    ctx.fillStyle = s.color;
+    ctx.fillRect(Math.round(s.x), Math.round(s.y), s.size, s.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+export function startMissionMinigame() {
+  const m = getMission();
+  mgState.type = m.minigame;
+  mgState.score = 25;
+  mgState.active = true;
+  mgState.valA = 50;
+  mgState.valB = 0;
+  mgState.vel = 1;
+  mgState.timer = 0;
+  mgState.errors = 0;
+  mgState.hits = 0;
+  mgState.data = {};
+  clearMgFx();
+
+  const hud = document.getElementById("minigame-hud");
+  const titleEl = document.getElementById("mg-title");
+  const bodyEl = document.getElementById("mg-body");
+  if (!hud || !titleEl || !bodyEl) return;
+  hud.classList.remove("hidden", "mg-hit-ok", "mg-hit-err");
+
+  const isEn = getLang() === "en";
+
+  // 1. M1: IGNITION_SEQUENCE — Sequenciamento Completo de Ignição 5-Chaves c/ Pressão
+  if (m.minigame === "IGNITION_SEQUENCE") {
+    const stepsPt = [
+      { id: 1, code: "PURG", label: "PRÉ-PURGA" },
+      { id: 2, code: "CRIO", label: "BOMBA CRIO" },
+      { id: 3, code: "IGNT", label: "IGNIÇÃO AUX" },
+      { id: 4, code: "MAIN", label: "VÁLVULA MAIN" },
+      { id: 5, code: "CLMP", label: "SOLTAR TORRE" }
+    ];
+    const stepsEn = [
+      { id: 1, code: "PURG", label: "PRE-PURGE" },
+      { id: 2, code: "CRIO", label: "CRYO PUMP" },
+      { id: 3, code: "IGNT", label: "AUX IGNITE" },
+      { id: 4, code: "MAIN", label: "MAIN VALVE" },
+      { id: 5, code: "CLMP", label: "RELEASE PAD" }
+    ];
+    const catalog = isEn ? stepsEn : stepsPt;
+    const makeSeq = () => shuffleOrder([1, 2, 3, 4, 5]);
+    const seq = makeSeq();
+    mgState.data = { seq, idx: 0, round: 1, seqTime: 5.5, catalog, makeSeq };
+
+    titleEl.textContent = isEn
+      ? "IGNITION_SEQUENCE · 5-STAGE IGNITION DECK"
+      : "IGNITION_SEQUENCE · MESA DE IGNIÇÃO 5-CHAVES";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between gap-2 bg-hull-950 border border-slate-700 px-2.5 py-1.5 text-[10px] font-mono">
+        <span class="truncate">SEQ: <b id="mg-ig-manual" class="text-amber-300"></b></span>
+        <span class="shrink-0 text-slate-300"><b id="mg-ig-timer" class="text-cyan-300 mr-1.5">5.5s</b><b id="mg-ig-prog" class="text-emerald-300">0/5</b></span>
+      </div>
+      <div class="w-full h-2.5 bg-hull-950 border border-slate-700 overflow-hidden">
+        <div id="mg-ig-bar" class="h-full bg-emerald-400 transition-all duration-150" style="width:10%"></div>
+      </div>
+      <div class="grid grid-cols-5 gap-1.5">
+        ${catalog.map((s) => `
+          <button type="button" data-ig="${s.id}" id="mg-ig-${s.id}" class="pixel-btn py-2 px-1 bg-hull-800 text-slate-100 font-pixel text-[8px] leading-tight text-center flex flex-col items-center gap-1">
+            <span id="mg-ig-led-${s.id}" class="w-3 h-1.5 bg-slate-600 border border-black inline-block"></span>
+            <div class="text-amber-300">[${s.id}] ${s.code}</div>
+            <div class="font-mono text-[9px] text-slate-300 truncate w-full">${s.label}</div>
+          </button>`).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-ig]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-ig")), btn as HTMLElement));
+    });
+
+  // 2. M2: CIRCUIT_PATCH — Painel de Circuitos sob Relógio Curto (6.8s)
+  } else if (m.minigame === "CIRCUIT_PATCH") {
+    const ports = [
+      { id: "A", label: "BUS-A", color: "#fbbf24" },
+      { id: "B", label: "TLM-B", color: "#38bdf8" },
+      { id: "C", label: "OPT-C", color: "#34d399" },
+      { id: "D", label: "NAV-D", color: "#f472b6" }
+    ];
+    const makeBoard = () => {
+      const rightOrder = shuffleOrder([0, 1, 2, 3]).map((idx) => ports[idx]);
+      return { rightOrder, matched: {} as Record<string, boolean>, selectedLeft: null as string | null };
+    };
+    const board = makeBoard();
+    mgState.data = { ports, ...board, makeBoard, boardTime: 6.8, solvedCount: 0 };
+
+    titleEl.textContent = isEn
+      ? "CIRCUIT_PATCH · POWER BUS ROUTING"
+      : "CIRCUIT_PATCH · CONEXÃO DE CABOS DO PAINEL";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between text-[10px] font-mono text-slate-300">
+        <span>${isEn ? "BUS TIMER:" : "TEMPO DO PAINEL:"} <b id="mg-cp-time" class="text-amber-300">6.8s</b></span>
+        <span id="mg-cp-solved" class="text-emerald-300 font-bold">0/4</span>
+      </div>
+      <div id="mg-cp-wrap" class="relative grid grid-cols-2 gap-8 text-[9px] font-pixel">
+        <svg id="mg-cp-wires" viewBox="0 0 200 100" preserveAspectRatio="none" class="pointer-events-none absolute inset-0 w-full h-full z-10"></svg>
+        <div id="mg-cp-left" class="space-y-1.5 relative z-20">
+          ${ports.map((p) => `<button type="button" data-cpl="${p.id}" class="w-full px-2 py-1.5 border-2 text-left font-mono text-[10px] flex justify-between items-center bg-hull-900 border-slate-700 text-white"><span>${p.label}</span><span style="color:${p.color}">●</span></button>`).join("")}
+        </div>
+        <div id="mg-cp-right" class="space-y-1.5 relative z-20">
+          ${board.rightOrder.map((p, idx) => `<button type="button" data-cpr-idx="${idx}" data-cpr="${p.id}" class="w-full px-2 py-1.5 border-2 text-left font-mono text-[10px] flex justify-between items-center bg-hull-900 border-slate-700 text-slate-200 hover:border-cyan-400"><span class="cp-dot" style="color:${p.color}">●</span><span class="cp-lbl">${p.label}</span></button>`).join("")}
+        </div>
+      </div>`;
+    bodyEl.querySelectorAll("[data-cpl]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("cp_left", btn.getAttribute("data-cpl"), btn as HTMLElement));
+    });
+    bodyEl.querySelectorAll("[data-cpr]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("cp_right", btn.getAttribute("data-cpr"), btn as HTMLElement));
+    });
+
+  // 3. M3: CARGO_BALANCE — Balanceamento Dinâmico com Rajadas de Torque (2.6s)
+  } else if (m.minigame === "CARGO_BALANCE") {
+    const arms = [-2, -1, 0, 1, 2];
+    const seeds = [
+      [120, 0, 40, 60, 0],
+      [0, 80, 20, 0, 140],
+      [100, 50, 0, 0, 90]
+    ];
+    mgState.data = {
+      weights: [...seeds[Math.floor(Math.random() * seeds.length)]],
+      selectedSlot: -1,
+      windMoment: Math.random() < 0.5 ? -95 : 95,
+      windTimer: 2.6
+    };
+    titleEl.textContent = isEn
+      ? "CARGO_BALANCE · CENTER OF MASS STABILIZER"
+      : "CARGO_BALANCE · ESTABILIZADOR DE CENTRO DE MASSA";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between text-[10px] font-mono">
+        <span>${isEn ? "SOLAR TORQUE:" : "TORQUE SOLAR:"} <b id="mg-cb-wind" class="text-amber-300">-95</b></span>
+        <span>${isEn ? "CoM OFFSET:" : "DESVIO CoM:"} <b id="mg-cb-com" class="text-cyan-300">0.0</b></span>
+      </div>
+      <div class="flex items-center gap-3">
+        <svg viewBox="0 0 120 36" class="w-28 h-9 bg-hull-950 border border-slate-700 shrink-0">
+          <line x1="12" y1="22" x2="108" y2="22" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3" />
+          <polygon points="56,31 64,31 60,23" fill="#475569" />
+          <line id="mg-cb-beam" x1="16" y1="22" x2="104" y2="22" stroke="#38bdf8" stroke-width="4" stroke-linecap="round" />
+        </svg>
+        <div class="relative flex-1 h-4 bg-hull-950 border border-slate-700">
+          <div class="absolute inset-y-0 left-[41%] right-[41%] bg-emerald-500/35 border-x border-emerald-400"></div>
+          <div id="mg-cb-needle" class="absolute inset-y-0 w-2 bg-amber-300" style="left:50%"></div>
+        </div>
+      </div>
+      <div id="mg-cb-bays" class="grid grid-cols-5 gap-1.5">
+        ${arms.map((arm, idx) => `<button type="button" data-cb="${idx}" class="py-1.5 px-1 border-2 font-mono text-[10px] text-center bg-hull-950 border-slate-700 text-slate-300"><div>B${arm >= 0 ? `+${arm}` : arm}</div><b id="mg-cb-w-${idx}">—</b></button>`).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-cb]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("cb_bay", Number(btn.getAttribute("data-cb")), btn as HTMLElement));
+    });
+
+  // 4. M4: THERMAL_MANOMETER — Manômetros com Deriva Térmica Intensa
+  } else if (m.minigame === "THERMAL_MANOMETER") {
+    const dials = [
+      { name: "CRIO LHe", val: 16, tgt: 72, drift: 13 },
+      { name: isEn ? "SHIELD K" : "ESCUDO K", val: 88, tgt: 38, drift: -15 },
+      { name: "RAD BAR", val: 20, tgt: 74, drift: 12 }
+    ];
+    mgState.data = { dials };
+    titleEl.textContent = isEn
+      ? "THERMAL_MANOMETER · ROTARY PRESSURE VALVES"
+      : "THERMAL_MANOMETER · VÁLVULAS & MANÔMETROS";
+    bodyEl.innerHTML = `
+      <div id="mg-tm-grid" class="grid grid-cols-3 gap-2">
+        ${dials.map((dl, idx) => {
+          const tgtRot = -110 + (dl.tgt / 100) * 220;
+          return `
+            <div id="mg-tm-card-${idx}" class="bg-hull-950 border-2 border-slate-700 p-1.5 text-center space-y-1">
+              <div class="flex items-center justify-between text-[9px] font-mono">
+                <span id="mg-tm-lbl-${idx}" class="text-amber-300 font-bold truncate">${dl.name}</span>
+                <span id="mg-tm-val-${idx}" class="text-white tabular-nums">${Math.round(dl.val)}</span>
+              </div>
+              <svg viewBox="0 0 80 46" class="w-20 h-11 mx-auto">
+                <path d="M 12 40 A 28 28 0 1 1 68 40" fill="none" stroke="#ef4444" stroke-width="5" stroke-opacity="0.45" />
+                <path d="M 24 14 A 28 28 0 0 1 56 14" fill="none" stroke="#10b981" stroke-width="5" stroke-opacity="0.35" />
+                <line x1="40" y1="38" x2="${(40 + Math.sin((tgtRot * Math.PI) / 180) * 26).toFixed(1)}" y2="${(38 - Math.cos((tgtRot * Math.PI) / 180) * 26).toFixed(1)}" stroke="#34d399" stroke-width="2.5" stroke-dasharray="2 2" />
+                <line id="mg-tm-ptr-${idx}" x1="40" y1="38" x2="40" y2="14" stroke="#fbbf24" stroke-width="3" stroke-linecap="round" />
+                <circle cx="40" cy="38" r="3.5" fill="#cbd5e1" />
+              </svg>
+              <div class="flex gap-1">
+                <button type="button" data-tmi="${idx}" data-tmd="-15" class="pixel-btn flex-1 py-1 bg-hull-800 text-[10px] font-mono text-white">-15°</button>
+                <button type="button" data-tmi="${idx}" data-tmd="15" class="pixel-btn flex-1 py-1 bg-hull-800 text-[10px] font-mono text-white">+15°</button>
+              </div>
+            </div>`;
+        }).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-tmi]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        minigameAction(
+          "tm_adj",
+          {
+            idx: Number(btn.getAttribute("data-tmi")),
+            delta: Number(btn.getAttribute("data-tmd"))
+          },
+          btn as HTMLElement
+        )
+      );
+    });
+
+  // 5. M5: TERMINAL_DIAGNOSTIC — 6 Falhas Aleatórias + Watchdog Timer
+  } else if (m.minigame === "TERMINAL_DIAGNOSTIC") {
+    const baseCases = [
+      { errPt: "ERR_0x1A: CRC checksum inválido no pacote DSN", errEn: "ERR_0x1A: Invalid CRC checksum in DSN packet", cmd: "FIX_CRC", opts: ["FIX_CRC", "REBOOT_BUS", "FLUSH_RAM"] },
+      { errPt: "ERR_0x4F: Dessincronia de relógio atômico Mars-TX", errEn: "ERR_0x4F: Atomic clock desync on Mars-TX", cmd: "SYNC_CLK", opts: ["DROP_PKT", "SYNC_CLK", "RESET_IR"] },
+      { errPt: "ERR_0x7C: Overflow de buffer banda Ka", errEn: "ERR_0x7C: Ka-Band telemetry buffer overflow", cmd: "FLUSH_KA", opts: ["FLUSH_KA", "FIX_CRC", "LOCK_NAV"] },
+      { errPt: "ERR_0x92: Queda de fase no modulador BPSK", errEn: "ERR_0x92: BPSK carrier phase-lock drop", cmd: "LOCK_PLL", opts: ["LOCK_PLL", "FLUSH_KA", "PING_DSN"] },
+      { errPt: "ERR_0xB4: Bitflip de radiação no barramento NVM", errEn: "ERR_0xB4: Radiation SEU bitflip in NVM bus", cmd: "ECC_SCRUB", opts: ["SYNC_CLK", "ECC_SCRUB", "ZERO_MEM"] },
+      { errPt: "ERR_0xE8: Latência crítica no transponder X-Band", errEn: "ERR_0xE8: Critical latency in X-Band transponder", cmd: "BOOST_TX", opts: ["BOOST_TX", "DROP_PKT", "LOCK_PLL"] }
+    ];
+    const order = shuffleOrder(baseCases.map((_, idx) => idx));
+    const cases = order.map((idx) => {
+      const c = baseCases[idx];
+      const shufOpts = shuffleOrder([0, 1, 2]).map((o) => c.opts[o]);
+      return { ...c, opts: shufOpts };
+    });
+    mgState.data = { cases, idx: 0, wdTimer: 3.8 };
+    titleEl.textContent = isEn
+      ? "TERMINAL_DIAGNOSTIC · TELEMETRY KERNEL PATCH"
+      : "TERMINAL_DIAGNOSTIC · PATCH DE TELEMETRIA";
+    bodyEl.innerHTML = `
+      <div class="bg-[#031207] border-2 border-[#176e2e] px-2.5 py-1.5 font-mono text-[11px] text-[#33ff66] crt-glow flex items-center justify-between gap-2">
+        <div class="truncate"><span>&gt; </span><span id="mg-tdg-err"></span><span class="mg-blink-led">_</span></div>
+        <span id="mg-tdg-wd" class="shrink-0 text-amber-300 font-bold">3.8s</span>
+      </div>
+      <form id="mg-tdg-form" class="flex gap-1.5">
+        <input id="mg-tdg-in" type="text" autocomplete="off" placeholder="${isEn ? "TYPE PATCH CMD..." : "DIGITE COMANDO..."}" class="flex-1 bg-hull-950 border-2 border-emerald-500/60 px-2.5 py-1.5 text-xs font-mono text-emerald-300 uppercase focus:outline-none focus:border-amber-400" />
+        <button type="submit" class="pixel-btn px-3 py-1.5 bg-emerald-400 text-black font-pixel text-[9px]">RUN</button>
+      </form>
+      <div id="mg-tdg-btns" class="grid grid-cols-3 gap-1.5"></div>`;
+    const form = document.getElementById("mg-tdg-form");
+    const input = document.getElementById("mg-tdg-in") as HTMLInputElement | null;
+    form?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (!input) return;
+      minigameAction("terminal", input.value.trim().toUpperCase(), form);
+      input.value = "";
+    });
+
+  // 6. M6: BINARY_LOGIC_GATE — Portas Multi-Bits (sem potências triviais) + Surto Joviano (4.2s)
+  } else if (m.minigame === "BINARY_LOGIC_GATE") {
+    const nonTrivial = [3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15];
+    const nextPuzzle = () => {
+      const target = nonTrivial[Math.floor(Math.random() * nonTrivial.length)];
+      return { target, bits: [0, 0, 0, 0], gateTime: 4.2 };
+    };
+    mgState.data = { ...nextPuzzle(), nextPuzzle, solved: 0 };
+    titleEl.textContent = isEn
+      ? "BINARY_LOGIC_GATE · 4-BIT RADIATION SHIELD"
+      : "BINARY_LOGIC_GATE · PORTA LÓGICA 4-BITS";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between text-xs font-mono bg-hull-950 border border-slate-700 px-3 py-1.5">
+        <span>${isEn ? "TARGET:" : "ALVO:"} <b id="mg-bg-tgt" class="text-amber-300">0x00 (0)</b></span>
+        <span id="mg-bg-wd" class="text-rose-300 font-bold">4.2s</span>
+        <span>${isEn ? "CURRENT:" : "ATUAL:"} <b id="mg-bg-cur" class="text-cyan-300">0000 (0)</b></span>
+      </div>
+      <div class="grid grid-cols-4 gap-2" id="mg-bg-btns">
+        <button type="button" data-bg="1" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">[1] 8: 0</button>
+        <button type="button" data-bg="2" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">[2] 4: 0</button>
+        <button type="button" data-bg="3" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">[3] 2: 0</button>
+        <button type="button" data-bg="4" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">[4] 1: 0</button>
+      </div>`;
+    bodyEl.querySelectorAll("[data-bg]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-bg")), btn as HTMLElement));
+    });
+
+  // 7. M7: TRAJECTORY_LOCK — 4 Travas Progressivas em Janela Estreita (41..59%)
+  } else if (m.minigame === "TRAJECTORY_LOCK") {
+    mgState.valA = 10;
+    mgState.valB = 0;
+    titleEl.textContent = isEn
+      ? "TRAJECTORY_LOCK · KINETIC INTERCEPT RETICLE"
+      : "TRAJECTORY_LOCK · MIRA DE INTERCEPTAÇÃO DART";
+    bodyEl.innerHTML = `
+      <div class="relative w-full h-7 bg-hull-950 border-2 border-slate-700 overflow-hidden">
+        <div class="absolute inset-y-0 left-[41%] right-[41%] bg-emerald-500/35 border-x-2 border-emerald-400"></div>
+        <div id="mg-needle" class="absolute inset-y-0 w-2 bg-cyan-300 shadow-[0_0_8px_#38bdf8]" style="left:10%"></div>
+      </div>
+      <div class="flex justify-between items-center text-xs font-mono">
+        <span id="mg-hint" class="text-slate-200">${isEn ? "Locks: 0/4" : "Travas: 0/4"}</span>
+        <button type="button" id="mg-btn-1" class="pixel-btn px-4 py-2 bg-cyan-400 text-black font-pixel text-[9px]">${isEn ? "LOCK IMPACT [SPACE]" : "TRAVAR IMPACTO [ESPAÇO]"}</button>
+      </div>`;
+    document.getElementById("mg-btn-1")?.addEventListener("click", () => minigameAction("space", 1, document.getElementById("mg-btn-1")));
+
+  // 8. M8: RING_NAV_CLICK — 4 Corredores nos Anéis de Saturno & Detritos Rápidos
+  } else if (m.minigame === "RING_NAV_CLICK") {
+    const nextWave = () => ({ safeLane: Math.floor(Math.random() * 4), dist: 100 });
+    mgState.data = { ...nextWave(), selectedLane: 1, nextWave, cleared: 0 };
+    titleEl.textContent = isEn
+      ? "RING_NAV_CLICK · SATURN ICE RADAR (4 LANES)"
+      : "RING_NAV_CLICK · RADAR ANÉIS DE SATURNO (4 FAIXAS)";
+    bodyEl.innerHTML = `
+      <div class="text-[10px] font-mono text-slate-300 flex justify-between">
+        <span>${isEn ? "Click CLEAR green lane before ice hits!" : "Clique na faixa VERDE LIVRE antes do impacto!"}</span>
+        <span id="mg-rn-cleared" class="text-emerald-300 font-bold">0</span>
+      </div>
+      <div id="mg-rn-lanes" class="grid grid-cols-1 gap-1">
+        ${[0, 1, 2, 3].map((lane) => `
+          <button type="button" id="mg-rn-btn-${lane}" data-rn="${lane + 1}" class="relative h-5 border-2 text-left px-2 font-mono text-[10px] flex items-center justify-between bg-hull-900 border-slate-700 text-slate-200">
+            <span id="mg-rn-txt-${lane}">[${lane + 1}] ...</span>
+            <span id="mg-rn-ind-${lane}" class="inline-block"></span>
+          </button>`).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-rn]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-rn")), btn as HTMLElement));
+    });
+
+  // 9. M9: SOLAR_SHIELD_FLUX — Onda Coronal Multi-Harmônica
+  } else if (m.minigame === "SOLAR_SHIELD_FLUX") {
+    mgState.data = { shieldVal: 50, solarTarget: 64 };
+    titleEl.textContent = isEn
+      ? "SOLAR_SHIELD_FLUX · CORONA SHIELD MODULATOR"
+      : "SOLAR_SHIELD_FLUX · MODULADOR DE ESCUDO SOLAR";
+    bodyEl.innerHTML = `
+      <div class="flex justify-between text-xs font-mono">
+        <span>${isEn ? "CORONA WAVE:" : "ONDA SOLAR:"} <b id="mg-sf-tgt" class="text-amber-300">64%</b></span>
+        <span id="mg-sf-lock" class="text-cyan-300 font-bold">TRACKING</span>
+        <span>${isEn ? "SHIELD:" : "ESCUDO:"} <b id="mg-sf-cur" class="text-cyan-300">50%</b></span>
+      </div>
+      <div class="relative w-full h-5 bg-hull-950 border-2 border-slate-700">
+        <div id="mg-sf-zone" class="absolute inset-y-0 w-[16%] bg-amber-400/35 border-x-2 border-amber-300" style="left:46%"></div>
+        <div id="mg-sf-bar" class="absolute inset-y-0 w-2 bg-cyan-300" style="left:50%"></div>
+      </div>
+      <input id="mg-sf-range" type="range" min="5" max="95" value="50" class="w-full accent-emerald-400 cursor-pointer h-4" />`;
+    const slider = document.getElementById("mg-sf-range") as HTMLInputElement | null;
+    slider?.addEventListener("input", () => {
+      mgState.data.shieldVal = Number(slider.value);
+    });
+
+  // 10. M10: SPECTROMETER_HARMONIC — Sintonia 3 Bandas com Deriva Orbital
+  } else if (m.minigame === "SPECTROMETER_HARMONIC") {
+    const bands = [
+      { name: "S-BAND", val: 25, tgt: 75, drift: 4.5 },
+      { name: "Ka-BAND", val: 85, tgt: 30, drift: -5.2 },
+      { name: "LASER", val: 35, tgt: 80, drift: 4.0 }
+    ];
+    mgState.data = { bands };
+    titleEl.textContent = isEn
+      ? "SPECTROMETER_HARMONIC · 3-BAND TUNER"
+      : "SPECTROMETER_HARMONIC · SINTONIA 3 BANDAS";
+    bodyEl.innerHTML = `
+      <div id="mg-sh-list" class="space-y-1.5">
+        ${bands.map((b, idx) => `
+          <div class="flex items-center gap-2 text-[10px] font-mono">
+            <span id="mg-sh-lbl-${idx}" class="w-16 shrink-0 text-slate-300">${b.name}</span>
+            <div class="relative flex-1 h-4 bg-hull-950 border border-slate-700">
+              <div class="absolute inset-y-0 w-[14%] bg-emerald-500/35 border-x border-emerald-400" style="left:${Math.max(0, b.tgt - 7)}%"></div>
+              <div id="mg-sh-cur-${idx}" class="absolute inset-y-0 w-2 bg-cyan-300" style="left:${b.val}%"></div>
+            </div>
+            <button type="button" data-shi="${idx}" data-shd="-10" class="pixel-btn px-2.5 py-0.5 bg-hull-800 text-white font-bold">-</button>
+            <button type="button" data-shi="${idx}" data-shd="10" class="pixel-btn px-2.5 py-0.5 bg-hull-800 text-white font-bold">+</button>
+          </div>`).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-shi]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        minigameAction(
+          "sh_adj",
+          {
+            idx: Number(btn.getAttribute("data-shi")),
+            delta: Number(btn.getAttribute("data-shd"))
+          },
+          btn as HTMLElement
+        )
+      );
+    });
+
+  // 11. M11: COOLANT_MATRIX — Válvulas 2/3-Nós + Surto Térmico 4.0s
+  } else if (m.minigame === "COOLANT_MATRIX") {
+    const nodes = [
+      { label: isEn ? "NODE A (V1+V2+V4)" : "NÓ A (V1+V2+V4)", req: [true, true, false, true] },
+      { label: isEn ? "NODE B (V2+V3)" : "NÓ B (V2+V3)", req: [false, true, true, false] },
+      { label: isEn ? "NODE C (V2+V3+V4)" : "NÓ C (V2+V3+V4)", req: [false, true, true, true] },
+      { label: isEn ? "NODE D (V1+V4)" : "NÓ D (V1+V4)", req: [true, false, false, true] }
+    ];
+    mgState.data = { valves: [false, false, false, false], nodes, hotIdx: Math.floor(Math.random() * nodes.length), nodeTime: 4.0 };
+    titleEl.textContent = isEn
+      ? "COOLANT_MATRIX · RTG COOLANT VALVES"
+      : "COOLANT_MATRIX · VÁLVULAS DE RESFRIAMENTO RTG";
+    bodyEl.innerHTML = `
+      <div class="flex justify-between items-center text-xs font-mono bg-hull-950 border-2 border-rose-500/60 px-2.5 py-1.5">
+        <span>${isEn ? "HOT!" : "QUENTE!"} <b id="mg-rc-hot" class="text-rose-400 mg-blink-led">${nodes[0].label}</b></span>
+        <span id="mg-rc-timer" class="text-amber-300 font-bold">4.0s</span>
+        <span id="mg-rc-st" class="text-cyan-300 font-bold">${isEn ? "ACTIVE: NONE" : "ATIVAS: NENHUMA"}</span>
+      </div>
+      <div class="grid grid-cols-4 gap-2">
+        <button type="button" data-rc="1" class="pixel-btn py-2.5 bg-hull-800 text-slate-200 font-pixel text-[9px]">V1 [1]</button>
+        <button type="button" data-rc="2" class="pixel-btn py-2.5 bg-hull-800 text-slate-200 font-pixel text-[9px]">V2 [2]</button>
+        <button type="button" data-rc="3" class="pixel-btn py-2.5 bg-hull-800 text-slate-200 font-pixel text-[9px]">V3 [3]</button>
+        <button type="button" data-rc="4" class="pixel-btn py-2.5 bg-hull-800 text-slate-200 font-pixel text-[9px]">V4 [4]</button>
+      </div>`;
+    bodyEl.querySelectorAll("[data-rc]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-rc")), btn as HTMLElement));
+    });
+
+  // 12. M12: GRAVITY_SLINGSHOT — 4 Queimas Aceleradas no Periastro (322°..38°)
+  } else if (m.minigame === "GRAVITY_SLINGSHOT") {
+    mgState.data = { angleDeg: 110, burns: 0 };
+    titleEl.textContent = isEn
+      ? "GRAVITY_SLINGSHOT · PERIAPSIS ASSIST PLOTTER"
+      : "GRAVITY_SLINGSHOT · PLOTADOR DE PERIASTRO";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between gap-3">
+        <svg viewBox="0 0 120 68" class="w-36 h-20 bg-hull-950 border-2 border-slate-700 shrink-0">
+          <ellipse cx="56" cy="34" rx="44" ry="24" fill="none" stroke="#334155" stroke-width="2" />
+          <path d="M 90 17 A 44 24 0 0 1 90 51" fill="none" stroke="#fbbf24" stroke-width="5" />
+          <circle cx="70" cy="34" r="8" fill="#94a3b8" />
+          <circle id="mg-gs-probe" cx="100" cy="34" r="4" fill="#38bdf8" />
+        </svg>
+        <div class="flex-1 space-y-2 text-xs font-mono">
+          <div id="mg-gs-hint" class="text-amber-300 font-bold">${isEn ? "Burns: 0/4" : "Queimas: 0/4"}</div>
+          <button type="button" id="mg-gs-btn" class="pixel-btn w-full py-2.5 bg-amber-400 text-black font-pixel text-[9px]">${isEn ? "FIRE BURN [SPACE]" : "QUEIMA [ESPAÇO]"}</button>
+        </div>
+      </div>`;
+    document.getElementById("mg-gs-btn")?.addEventListener("click", () => minigameAction("space", 1, document.getElementById("mg-gs-btn")));
+
+  // 13. M13: OPTICAL_RING_LOCK — Anéis Múltiplos Desalinhados
+  } else if (m.minigame === "OPTICAL_RING_LOCK") {
+    const pickAngles = () => [90, 180, 270, 45].map(() => [45, 90, 135, 180, 225, 270, 315][Math.floor(Math.random() * 7)]);
+    mgState.data = { angles: pickAngles(), pickAngles };
+    titleEl.textContent = isEn
+      ? "OPTICAL_RING_LOCK · HEX MIRROR ALIGNMENT"
+      : "OPTICAL_RING_LOCK · ALINHAMENTO DE ESPELHOS";
+    bodyEl.innerHTML = `
+      <div class="grid grid-cols-4 gap-2">
+        ${[0, 1, 2, 3].map((i) => `
+          <button type="button" data-lo="${i + 1}" id="mg-lo-${i}" class="pixel-btn py-1.5 px-1 bg-hull-800 text-amber-300 font-pixel text-[8px] flex flex-col items-center gap-1">
+            <svg viewBox="0 0 40 40" class="w-9 h-9">
+              <g id="mg-lo-hex-${i}" transform="rotate(90 20 20)">
+                <polygon points="20,4 34,12 34,28 20,36 6,28 6,12" fill="none" stroke="currentColor" stroke-width="2.5" />
+                <line x1="20" y1="20" x2="20" y2="5" stroke="#ffffff" stroke-width="2.5" />
+              </g>
+            </svg>
+            <span id="mg-lo-txt-${i}">S${i + 1}: 90°</span>
+          </button>`).join("")}
+      </div>`;
+    bodyEl.querySelectorAll("[data-lo]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-lo")), btn as HTMLElement));
+    });
+
+  // 14. M14: MORSE_BEACON_SYNC — Decodificador Voyager c/ Desvanecimento (5.5s)
+  } else if (m.minigame === "MORSE_BEACON_SYNC") {
+    const nextCode = () => Array.from({ length: 5 }, () => (Math.random() < 0.5 ? "•" : "—"));
+    mgState.data = { pattern: nextCode(), idx: 0, round: 1, pktTime: 5.5, nextCode };
+    titleEl.textContent = isEn
+      ? "MORSE_BEACON_SYNC · VOYAGER DEEP-SPACE DECODER"
+      : "MORSE_BEACON_SYNC · DECODIFICADOR VOYAGER";
+    bodyEl.innerHTML = `
+      <div class="flex items-center justify-between text-sm font-mono bg-hull-950 border-2 border-cyan-500/50 px-3 py-2">
+        <span>${isEn ? "SIGNAL:" : "SINAL:"} <b id="mg-mb-pat" class="text-amber-300 tracking-widest"></b></span>
+        <span id="mg-mb-wd" class="text-xs text-rose-300 font-bold">5.5s</span>
+        <span id="mg-mb-prog" class="text-emerald-300 font-bold">0/5</span>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <button type="button" id="mg-mb-dot" class="pixel-btn py-2.5 bg-cyan-400 text-black font-pixel text-[9px]">${isEn ? "• DOT [Z]" : "• CURTO [Z]"}</button>
+        <button type="button" id="mg-mb-dash" class="pixel-btn py-2.5 bg-amber-400 text-black font-pixel text-[9px]">${isEn ? "— DASH [X]" : "— LONGO [X]"}</button>
+      </div>`;
+    document.getElementById("mg-mb-dot")?.addEventListener("click", () => minigameAction("dot", 1, document.getElementById("mg-mb-dot")));
+    document.getElementById("mg-mb-dash")?.addEventListener("click", () => minigameAction("dash", 1, document.getElementById("mg-mb-dash")));
+
+  // 15. M15: CORE_OVERRIDE — Protocolo Final Aleatório em 3 Fases (8 Pulsos Retro)
+  } else {
+    const rawBits = [0, 1, 2, 3].map(() => (Math.random() < 0.5 ? 1 : 0));
+    const targetBits = rawBits.some((b) => b === 1) ? rawBits : [1, 0, 1, 0];
+    mgState.data = { phase: 1, bits: [0, 0, 0, 0], targetBits, meco: 10, mecoVel: 1, retro: 0 };
+    titleEl.textContent = isEn
+      ? "CORE_OVERRIDE · PHASE 1/3 SECURITY CODE"
+      : "CORE_OVERRIDE · FASE 1/3 CÓDIGO DE SEGURANÇA";
+    bodyEl.innerHTML = `
+      <div id="mg-co-p1" class="space-y-2">
+        <div class="flex justify-between text-xs font-mono bg-hull-950 border border-slate-700 px-2.5 py-1.5">
+          <span>${isEn ? "TARGET:" : "ALVO:"} <b class="text-amber-300">${targetBits.join(" ")}</b></span>
+          <span id="mg-co-p1st" class="text-cyan-300 font-bold">0 0 0 0</span>
+        </div>
+        <div class="grid grid-cols-4 gap-2">
+          <button type="button" data-co-bit="1" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">K1: 0</button>
+          <button type="button" data-co-bit="2" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">K2: 0</button>
+          <button type="button" data-co-bit="3" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">K3: 0</button>
+          <button type="button" data-co-bit="4" class="pixel-btn py-2.5 bg-hull-800 text-white font-pixel text-[9px]">K4: 0</button>
+        </div>
+      </div>
+      <div id="mg-co-p23" class="hidden space-y-2">
+        <div class="relative w-full h-6 bg-hull-950 border-2 border-slate-700">
+          <div class="absolute inset-y-0 left-[39%] right-[39%] bg-emerald-500/35 border-x-2 border-emerald-400"></div>
+          <div id="mg-needle" class="absolute inset-y-0 w-2 bg-amber-300" style="left:10%"></div>
+        </div>
+        <div class="flex justify-between items-center gap-2 text-xs font-mono">
+          <span id="mg-co-hint" class="text-amber-300 font-bold">${isEn ? "Cut MECO in green!" : "Corte MECO no verde!"}</span>
+          <button type="button" id="mg-co-sp" class="pixel-btn px-4 py-2 bg-rose-400 text-black font-pixel text-[9px]">${isEn ? "EXECUTE [SPACE]" : "EXECUTAR [ESPAÇO]"}</button>
+        </div>
+      </div>`;
+    bodyEl.querySelectorAll("[data-co-bit]").forEach((btn) => {
+      btn.addEventListener("click", () => minigameAction("num", Number(btn.getAttribute("data-co-bit")), btn as HTMLElement));
+    });
+    document.getElementById("mg-co-sp")?.addEventListener("click", () => minigameAction("space", 1, document.getElementById("mg-co-sp")));
+  }
+
+  updateMissionMinigame(0);
+}
+
+export function minigameAction(cmd: string | number, payload: unknown = 1, sourceEl?: HTMLElement | null) {
+  if (!mgState.active) return;
+  audio.uiSelect();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const d = (mgState.data || {}) as any;
+  const key = typeof cmd === "string" ? cmd : Number(cmd) < 0 ? "left" : "right";
+  const numVal = typeof payload === "number" ? payload : Number(payload) || 0;
+  const isEn = getLang() === "en";
+
+  if (mgState.type === "IGNITION_SEQUENCE") {
+    const id = key === "num" ? numVal : 0;
+    if (id >= 1 && id <= 5) {
+      const btn = sourceEl || document.getElementById(`mg-ig-${id}`);
+      if (id === d.seq[d.idx]) {
+        d.idx += 1;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 7);
+        triggerMgFeedback(true, btn);
+        if (d.idx >= d.seq.length) {
+          d.round += 1;
+          d.seq = d.makeSeq();
+          d.idx = 0;
+          d.seqTime = 5.5;
+          mgState.score = Math.min(100, mgState.score + 12);
+          logFlight(isEn ? `Ignition stage #${d.round - 1} nominal!` : `Sequência de ignição #${d.round - 1} nominal!`);
+        }
+      } else {
+        d.idx = 0;
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 10);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+    }
+
+  } else if (mgState.type === "CIRCUIT_PATCH") {
+    if (key === "cp_left") {
+      d.selectedLeft = String(payload);
+      triggerMgFeedback(true, sourceEl || `[data-cpl="${d.selectedLeft}"]`);
+    } else if (key === "cp_right") {
+      const targetId = String(payload);
+      const btn = sourceEl || `[data-cpr="${targetId}"]`;
+      if (d.selectedLeft && d.selectedLeft === targetId && !d.matched[targetId]) {
+        d.matched[targetId] = true;
+        d.selectedLeft = null;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 9);
+        triggerMgFeedback(true, btn);
+        if (Object.keys(d.matched).length >= 4) {
+          d.solvedCount += 1;
+          const nextB = d.makeBoard();
+          d.rightOrder = nextB.rightOrder;
+          d.matched = nextB.matched;
+          d.selectedLeft = null;
+          d.boardTime = 6.8;
+          mgState.score = Math.min(100, mgState.score + 14);
+          logFlight(isEn ? `Circuit bus #${d.solvedCount} patched!` : `Barramento elétrico #${d.solvedCount} conectado!`);
+        }
+      } else {
+        d.selectedLeft = null;
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 8);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+    }
+
+  } else if (mgState.type === "CARGO_BALANCE") {
+    if (key === "cb_bay") {
+      const idx = numVal;
+      const btn = sourceEl || `[data-cb="${idx}"]`;
+      if (d.selectedSlot < 0) {
+        if (d.weights[idx] > 0) {
+          d.selectedSlot = idx;
+          triggerMgFeedback(true, btn);
+        }
+      } else if (d.selectedSlot === idx) {
+        d.selectedSlot = -1;
+      } else {
+        const tmp = d.weights[d.selectedSlot];
+        d.weights[d.selectedSlot] = d.weights[idx];
+        d.weights[idx] = tmp;
+        d.selectedSlot = -1;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 5);
+        triggerMgFeedback(true, btn);
+      }
+    }
+
+  } else if (mgState.type === "THERMAL_MANOMETER") {
+    if (key === "tm_adj") {
+      const { idx, delta } = payload as { idx: number; delta: number };
+      if (d.dials[idx]) {
+        d.dials[idx].val = Math.max(0, Math.min(100, d.dials[idx].val + delta));
+        const inRange = Math.abs(d.dials[idx].val - d.dials[idx].tgt) <= 12;
+        if (inRange) mgState.hits += 1;
+        triggerMgFeedback(inRange, sourceEl || `#mg-tm-card-${idx}`);
+      }
+    }
+
+  } else if (mgState.type === "TERMINAL_DIAGNOSTIC") {
+    const typed = String(payload || "").trim().toUpperCase();
+    const cur = d.cases[d.idx];
+    if (typed && cur) {
+      if (typed === cur.cmd) {
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 16);
+        d.idx = (d.idx + 1) % d.cases.length;
+        d.wdTimer = 3.8;
+        triggerMgFeedback(true, sourceEl || "#mg-tdg-err");
+        logFlight(isEn ? `Patch applied: ${typed} OK.` : `Patch executado: ${typed} OK.`);
+      } else {
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 10);
+        audio.alarm();
+        triggerMgFeedback(false, sourceEl || "#mg-tdg-err");
+      }
+    }
+
+  } else if (mgState.type === "BINARY_LOGIC_GATE") {
+    const bitIdx = key === "num" ? numVal - 1 : -1;
+    if (bitIdx >= 0 && bitIdx < 4) {
+      d.bits[bitIdx] = d.bits[bitIdx] === 1 ? 0 : 1;
+      const val = d.bits[0] * 8 + d.bits[1] * 4 + d.bits[2] * 2 + d.bits[3];
+      const btn = sourceEl || `[data-bg="${bitIdx + 1}"]`;
+      if (val === d.target) {
+        d.solved += 1;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 15);
+        const np = d.nextPuzzle();
+        d.target = np.target;
+        d.bits = np.bits;
+        d.gateTime = np.gateTime;
+        triggerMgFeedback(true, btn);
+        logFlight(isEn ? `Binary radiation gate #${d.solved} verified!` : `Porta binária de radiação #${d.solved} validada!`);
+      } else {
+        triggerMgFeedback(true, btn);
+      }
+    }
+
+  } else if (mgState.type === "TRAJECTORY_LOCK") {
+    if (key === "space") {
+      const btn = sourceEl || "#mg-btn-1";
+      if (mgState.valA >= 41 && mgState.valA <= 59) {
+        mgState.valB = Math.min(4, mgState.valB + 1);
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 19);
+        triggerMgFeedback(true, btn);
+        logFlight(isEn ? `Kinetic DART lock #${mgState.valB}/4 confirmed!` : `Trava cinética DART #${mgState.valB}/4 confirmada!`);
+      } else {
+        mgState.valB = Math.max(0, mgState.valB - 1);
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 10);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+      const h = document.getElementById("mg-hint");
+      if (h) h.textContent = isEn ? `Locks: ${mgState.valB}/4` : `Travas: ${mgState.valB}/4`;
+    }
+
+  } else if (mgState.type === "RING_NAV_CLICK") {
+    const lane = key === "num" ? numVal - 1 : -1;
+    if (lane >= 0 && lane <= 3) {
+      const btn = sourceEl || `#mg-rn-btn-${lane}`;
+      d.selectedLane = lane;
+      if (lane === d.safeLane) {
+        d.cleared += 1;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 13);
+        const nw = d.nextWave();
+        d.safeLane = nw.safeLane;
+        d.dist = nw.dist;
+        triggerMgFeedback(true, btn);
+      } else {
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 12);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+    }
+
+  } else if (mgState.type === "SPECTROMETER_HARMONIC") {
+    if (key === "sh_adj") {
+      const { idx, delta } = payload as { idx: number; delta: number };
+      if (d.bands[idx]) {
+        d.bands[idx].val = Math.max(5, Math.min(95, d.bands[idx].val + delta));
+        const ok = Math.abs(d.bands[idx].val - d.bands[idx].tgt) <= 8;
+        if (ok) mgState.hits += 1;
+        triggerMgFeedback(ok, sourceEl || `#mg-sh-cur-${idx}`);
+      }
+    }
+
+  } else if (mgState.type === "COOLANT_MATRIX") {
+    const vIdx = key === "num" ? numVal - 1 : -1;
+    if (vIdx >= 0 && vIdx < 4) {
+      d.valves[vIdx] = !d.valves[vIdx];
+      const target = d.nodes[d.hotIdx];
+      const btn = sourceEl || `[data-rc="${vIdx + 1}"]`;
+      if (target.req.every((reqOn: boolean, i: number) => d.valves[i] === reqOn)) {
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 18);
+        d.hotIdx = (d.hotIdx + 1) % d.nodes.length;
+        d.nodeTime = 4.0;
+        triggerMgFeedback(true, btn);
+        logFlight(isEn ? `Coolant loop stabilized: ${target.label}!` : `Circuito refrigerado: ${target.label} estabilizado!`);
+      } else {
+        triggerMgFeedback(true, btn);
+      }
+    }
+
+  } else if (mgState.type === "GRAVITY_SLINGSHOT") {
+    if (key === "space") {
+      const ang = d.angleDeg % 360;
+      const inArc = ang >= 322 || ang <= 38;
+      const btn = sourceEl || "#mg-gs-btn";
+      if (inArc) {
+        d.burns = Math.min(4, d.burns + 1);
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 19);
+        triggerMgFeedback(true, btn);
+        logFlight(isEn ? `Periapsis slingshot burn #${d.burns}/4!` : `Queima de estilingue no periastro #${d.burns}/4!`);
+      } else {
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 10);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+      const h = document.getElementById("mg-gs-hint");
+      if (h) h.textContent = isEn ? `Burns: ${d.burns}/4` : `Queimas: ${d.burns}/4`;
+    }
+
+  } else if (mgState.type === "OPTICAL_RING_LOCK") {
+    const sIdx = key === "num" ? numVal - 1 : -1;
+    if (sIdx >= 0 && sIdx < 4) {
+      const btn = sourceEl || `#mg-lo-${sIdx}`;
+      d.angles[sIdx] = (d.angles[sIdx] + 45) % 360;
+      const locked = d.angles[sIdx] === 0;
+      if (locked) {
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 8);
+      }
+      triggerMgFeedback(true, btn);
+      if (d.angles.every((a: number) => a === 0)) {
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 34);
+        d.angles = d.pickAngles();
+        logFlight(isEn ? "Hex mirrors aligned! Calibrating next optical ring..." : "Espelhos alinhados! Calibrando próximo anel óptico...");
+      }
+    }
+
+  } else if (mgState.type === "MORSE_BEACON_SYNC") {
+    const pulse = key === "dot" || key === "left" ? "•" : key === "dash" || key === "right" ? "—" : "";
+    if (pulse) {
+      const btn = sourceEl || (pulse === "•" ? "#mg-mb-dot" : "#mg-mb-dash");
+      if (pulse === d.pattern[d.idx]) {
+        d.idx += 1;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 6);
+        triggerMgFeedback(true, btn);
+        if (d.idx >= d.pattern.length) {
+          d.round += 1;
+          d.pattern = d.nextCode();
+          d.idx = 0;
+          d.pktTime = 5.5;
+          mgState.score = Math.min(100, mgState.score + 16);
+          logFlight(isEn ? `Interstellar beacon packet #${d.round - 1} locked!` : `Pacote do farol interestelar #${d.round - 1} travado!`);
+        }
+      } else {
+        d.idx = 0;
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 9);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+    }
+
+  } else if (mgState.type === "CORE_OVERRIDE") {
+    if (d.phase === 1 && key === "num") {
+      const idx = numVal - 1;
+      if (idx >= 0 && idx < 4) {
+        const btn = sourceEl || `[data-co-bit="${numVal}"]`;
+        d.bits[idx] = d.bits[idx] === 1 ? 0 : 1;
+        triggerMgFeedback(true, btn);
+        if (d.bits.every((b: number, i: number) => b === d.targetBits[i])) {
+          d.phase = 2;
+          mgState.hits += 1;
+          mgState.score = Math.min(100, mgState.score + 20);
+          document.getElementById("mg-co-p1")?.classList.add("hidden");
+          document.getElementById("mg-co-p23")?.classList.remove("hidden");
+          const tEl = document.getElementById("mg-title");
+          if (tEl) tEl.textContent = isEn ? "CORE_OVERRIDE · PHASE 2/3 MECO CUTOFF" : "CORE_OVERRIDE · FASE 2/3 CORTE MECO";
+          logFlight(isEn ? "Core security unlocked! Execute MECO cutoff." : "Travas liberadas! Execute corte MECO.");
+        }
+      }
+    } else if (d.phase === 2 && key === "space") {
+      const btn = sourceEl || "#mg-co-sp";
+      if (d.meco >= 39 && d.meco <= 61) {
+        d.phase = 3;
+        mgState.hits += 1;
+        mgState.score = Math.min(100, mgState.score + 20);
+        triggerMgFeedback(true, btn);
+        const tEl = document.getElementById("mg-title");
+        const hEl = document.getElementById("mg-co-hint");
+        if (tEl) tEl.textContent = isEn ? "CORE_OVERRIDE · PHASE 3/3 RETRO-BURN" : "CORE_OVERRIDE · FASE 3/3 RETROPROPULSÃO";
+        if (hEl) hEl.textContent = isEn ? "Fire 8 retro pulses (0/8)!" : "Dispare 8 pulsos retro (0/8)!";
+        logFlight(isEn ? "MECO cutoff nominal! Retro-propulsion active." : "Corte MECO nominal! Retropropulsão ativa.");
+      } else {
+        mgState.errors += 1;
+        mgState.score = Math.max(0, mgState.score - 10);
+        audio.alarm();
+        triggerMgFeedback(false, btn);
+      }
+    } else if (d.phase === 3 && key === "space") {
+      d.retro = Math.min(8, d.retro + 1);
+      mgState.hits += 1;
+      mgState.score = Math.min(100, mgState.score + 6);
+      triggerMgFeedback(true, sourceEl || "#mg-co-sp");
+      const hEl = document.getElementById("mg-co-hint");
+      if (hEl) hEl.textContent = isEn ? `Retro pulses: ${d.retro}/8` : `Pulsos retro: ${d.retro}/8`;
+    }
+  }
+}
+
+export function updateMissionMinigame(dt: number) {
+  if (!mgState.active) return;
+  mgState.timer += dt;
+  const stEl = document.getElementById("mg-status");
+  const clockEl = document.getElementById("mg-clock");
+  const barEl = document.getElementById("mg-timer-bar");
+  const calloutEl = document.getElementById("mg-callout");
+  const ledL = document.getElementById("mg-led-l");
+  const ledR = document.getElementById("mg-led-r");
+  const hud = document.getElementById("minigame-hud");
+
+  // Shared Ascent Urgency Clock & Regressive Bar
+  const visor = hooks?.getVisor3D();
+  const elapsed = visor ? visor.flight.t : mgState.timer;
+  const rem = Math.max(0, ASCENT_DURATION - elapsed);
+  const remPct = Math.max(0, Math.min(100, (rem / ASCENT_DURATION) * 100));
+  const urgent = rem <= 4.2;
+
+  if (clockEl) {
+    const nextClock = `T-${rem.toFixed(1)}s`;
+    if (nextClock !== lastMgClock) {
+      lastMgClock = nextClock;
+      clockEl.textContent = nextClock;
+    }
+    const nextClockCls = `px-1.5 py-0.5 font-bold border ${
+      urgent
+        ? "bg-rose-950 border-rose-400 text-rose-200 mg-pulse-urgent"
+        : "bg-hull-950 border-amber-500/60 text-amber-300"
+    }`;
+    if (nextClockCls !== lastMgClockClass) {
+      lastMgClockClass = nextClockCls;
+      clockEl.className = nextClockCls;
+    }
+  }
+  if (barEl) {
+    const nextBarW = `${remPct.toFixed(1)}%`;
+    if (nextBarW !== lastMgBarW) {
+      lastMgBarW = nextBarW;
+      barEl.style.width = nextBarW;
+    }
+    const nextBarCls = `h-full ${
+      urgent ? "bg-rose-500 mg-blink-led" : remPct < 55 ? "bg-amber-400" : "bg-cyan-400"
+    }`;
+    if (nextBarCls !== lastMgBarClass) {
+      lastMgBarClass = nextBarCls;
+      barEl.className = nextBarCls;
+    }
+  }
+  if (hud) {
+    const nextBorder = urgent ? "#fb7185" : mgHitStreak >= 3 ? "#34d399" : "#fbbf24";
+    if (nextBorder !== lastMgBorder) {
+      lastMgBorder = nextBorder;
+      hud.style.borderColor = nextBorder;
+    }
+  }
+  if (ledL) {
+    const nextLedL = `inline-block w-2.5 h-2.5 border border-black mg-blink-led shrink-0 ${
+      urgent ? "bg-rose-500" : "bg-amber-400"
+    }`;
+    if (nextLedL !== lastMgLedL) {
+      lastMgLedL = nextLedL;
+      ledL.className = nextLedL;
+    }
+  }
+  if (ledR) {
+    const nextLedR = `inline-block w-2.5 h-2.5 border border-black mg-blink-led shrink-0 ${
+      mgState.score >= 70 ? "bg-emerald-400" : urgent ? "bg-rose-500" : "bg-cyan-400"
+    }`;
+    if (nextLedR !== lastMgLedR) {
+      lastMgLedR = nextLedR;
+      ledR.className = nextLedR;
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const d = (mgState.data || {}) as any;
+  const isEn = getLang() === "en";
+  let calloutText = "";
+
+  if (mgState.type === "IGNITION_SEQUENCE") {
+    d.seqTime = Math.max(0, (d.seqTime ?? 5.5) - dt);
+    if (d.seqTime <= 0) {
+      d.idx = 0;
+      d.seqTime = 5.5;
+      d.seq = d.makeSeq();
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 10);
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-ig-manual");
+    }
+    const mEl = document.getElementById("mg-ig-manual");
+    const tEl = document.getElementById("mg-ig-timer");
+    const pEl = document.getElementById("mg-ig-prog");
+    const barIg = document.getElementById("mg-ig-bar");
+    const cat = d.catalog as { id: number; code: string }[];
+    const seq = d.seq as number[];
+    const nextId = seq[d.idx];
+    const nextCode = cat.find((x) => x.id === nextId)?.code || nextId;
+    if (mEl) {
+      mEl.textContent = seq.map((id, i) => {
+        const c = cat.find((x) => x.id === id)?.code || id;
+        return i < d.idx ? `✓${c}` : i === d.idx ? `▶[${id}:${c}]` : `${id}:${c}`;
+      }).join(" → ");
+    }
+    if (tEl) {
+      tEl.textContent = `${d.seqTime.toFixed(1)}s`;
+      tEl.className = d.seqTime <= 2.0 ? "text-rose-400 font-bold mr-1.5 mg-pulse-urgent" : "text-cyan-300 font-bold mr-1.5";
+    }
+    if (pEl) pEl.textContent = `${d.idx}/${seq.length}`;
+    if (barIg) barIg.style.width = `${Math.max(8, (d.idx / seq.length) * 100)}%`;
+
+    for (let id = 1; id <= 5; id++) {
+      const btn = document.getElementById(`mg-ig-${id}`);
+      const led = document.getElementById(`mg-ig-led-${id}`);
+      const seqPos = seq.indexOf(id);
+      const ignited = seqPos >= 0 && seqPos < d.idx;
+      const isNext = id === nextId;
+      if (btn) {
+        btn.className = `pixel-btn py-2 px-1 font-pixel text-[8px] leading-tight text-center flex flex-col items-center gap-1 ${
+          ignited
+            ? "bg-emerald-500/25 border-emerald-400 text-emerald-200"
+            : isNext
+              ? "bg-amber-400/25 border-amber-300 text-white mg-pulse-urgent"
+              : "bg-hull-800 text-slate-300"
+        }`;
+      }
+      if (led) {
+        led.className = `w-3 h-1.5 border border-black inline-block ${
+          ignited ? "bg-emerald-400" : isNext ? "bg-amber-300 mg-blink-led" : "bg-slate-600"
+        }`;
+      }
+    }
+    calloutText = isEn
+      ? `FAST CLICK [${nextId}] (${nextCode}) BEFORE ${d.seqTime.toFixed(1)}s!`
+      : `CLIQUE RÁPIDO [${nextId}] (${nextCode}) ANTES DE ${d.seqTime.toFixed(1)}s!`;
+
+  } else if (mgState.type === "CIRCUIT_PATCH") {
+    d.boardTime = Math.max(0, d.boardTime - dt);
+    if (d.boardTime <= 0) {
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 10);
+      const nb = d.makeBoard();
+      d.rightOrder = nb.rightOrder;
+      d.matched = nb.matched;
+      d.selectedLeft = null;
+      d.boardTime = 6.8;
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-cp-wrap");
+    }
+    const tEl = document.getElementById("mg-cp-time");
+    const sEl = document.getElementById("mg-cp-solved");
+    const matchedCount = Object.keys(d.matched).length;
+    if (tEl) {
+      tEl.textContent = `${d.boardTime.toFixed(1)}s`;
+      tEl.className = d.boardTime <= 2.5 ? "text-rose-400 font-bold mg-pulse-urgent" : "text-amber-300 font-bold";
+    }
+    if (sEl) sEl.textContent = `${matchedCount}/4`;
+
+    const leftBox = document.getElementById("mg-cp-left");
+    const rightBox = document.getElementById("mg-cp-right");
+    const wiresSvg = document.getElementById("mg-cp-wires");
+    const rightOrder = d.rightOrder as { id: string; label: string; color: string }[];
+    const ports = d.ports as { id: string; label: string; color: string }[];
+
+    if (leftBox && rightBox) {
+      leftBox.querySelectorAll<HTMLButtonElement>("[data-cpl]").forEach((btn) => {
+        const pid = btn.getAttribute("data-cpl") || "";
+        const done = !!d.matched[pid];
+        const sel = d.selectedLeft === pid;
+        btn.className = `w-full px-2 py-1.5 border-2 text-left font-mono text-[10px] flex justify-between items-center ${done ? "bg-emerald-950/60 border-emerald-400 text-emerald-300" : sel ? "bg-amber-400 text-black border-white font-bold mg-pulse-urgent" : "bg-hull-900 border-slate-700 text-white hover:border-amber-300"}`;
+      });
+      rightBox.querySelectorAll<HTMLButtonElement>("[data-cpr-idx]").forEach((btn, idx) => {
+        const p = rightOrder[idx];
+        if (!p) return;
+        btn.setAttribute("data-cpr", p.id);
+        const dot = btn.querySelector(".cp-dot") as HTMLElement | null;
+        const lbl = btn.querySelector(".cp-lbl");
+        if (dot) dot.style.color = p.color;
+        if (lbl) lbl.textContent = p.label;
+        const done = !!d.matched[p.id];
+        const tgtReady = d.selectedLeft === p.id && !done;
+        btn.className = `w-full px-2 py-1.5 border-2 text-left font-mono text-[10px] flex justify-between items-center ${done ? "bg-emerald-950/60 border-emerald-400 text-emerald-300" : tgtReady ? "bg-cyan-950/60 border-cyan-300 text-white" : "bg-hull-900 border-slate-700 text-slate-200 hover:border-cyan-400"}`;
+      });
+      if (wiresSvg) {
+        const yCenters = [13, 38, 63, 88];
+        wiresSvg.innerHTML = ports.map((p, li) => {
+          if (!d.matched[p.id]) return "";
+          const ri = rightOrder.findIndex((rp) => rp.id === p.id);
+          if (ri < 0) return "";
+          return `<line x1="8" y1="${yCenters[li]}" x2="192" y2="${yCenters[ri]}" stroke="${p.color}" stroke-width="3.5" stroke-linecap="round" />`;
+        }).join("");
+      }
+    }
+    calloutText = d.selectedLeft
+      ? (isEn ? `PLUG [${d.selectedLeft}] INTO MATCHING RIGHT SOCKET NOW!` : `CONECTE [${d.selectedLeft}] AO SOQUETE CORRESPONDENTE À DIREITA!`)
+      : (isEn ? "CLICK LEFT TERMINAL THEN MATCHING RIGHT SOCKET!" : "CLIQUE EM UM TERMINAL À ESQUERDA E CONECTE À DIREITA!");
+
+  } else if (mgState.type === "CARGO_BALANCE") {
+    d.windTimer -= dt;
+    if (d.windTimer <= 0) {
+      d.windTimer = 2.6;
+      const choices = [-120, -65, 65, 120].filter((x) => x !== d.windMoment);
+      d.windMoment = choices[Math.floor(Math.random() * choices.length)];
+    }
+    const arms = [-2, -1, 0, 1, 2];
+    const cargoMoment = (d.weights as number[]).reduce((acc, w, i) => acc + w * arms[i], 0);
+    const totalW = (d.weights as number[]).reduce((acc, w) => acc + w, 0) || 1;
+    const netOffset = (cargoMoment + d.windMoment) / totalW;
+    const balanced = Math.abs(netOffset) <= 0.28;
+    mgState.score = Math.max(0, Math.min(100, mgState.score + (balanced ? 18 : -11) * dt));
+
+    const wEl = document.getElementById("mg-cb-wind");
+    const cEl = document.getElementById("mg-cb-com");
+    const nEl = document.getElementById("mg-cb-needle");
+    const beamEl = document.getElementById("mg-cb-beam");
+    const baysEl = document.getElementById("mg-cb-bays");
+    if (wEl) wEl.textContent = `${d.windMoment > 0 ? "+" : ""}${d.windMoment} Nm`;
+    if (cEl) {
+      cEl.textContent = `${netOffset >= 0 ? "+" : ""}${netOffset.toFixed(2)}`;
+      cEl.className = balanced ? "text-emerald-300 font-bold" : "text-rose-400 font-bold mg-pulse-urgent";
+    }
+    if (nEl) nEl.style.left = `${Math.max(4, Math.min(94, 50 + netOffset * 32))}%`;
+    if (beamEl) {
+      const tiltY = Math.max(-10, Math.min(10, netOffset * 12));
+      beamEl.setAttribute("y1", (22 - tiltY).toFixed(1));
+      beamEl.setAttribute("y2", (22 + tiltY).toFixed(1));
+      beamEl.setAttribute("stroke", balanced ? "#34d399" : "#fb7185");
+    }
+    if (baysEl) {
+      baysEl.querySelectorAll<HTMLButtonElement>("[data-cb]").forEach((btn, idx) => {
+        const w = (d.weights as number[])[idx];
+        const sel = d.selectedSlot === idx;
+        btn.className = `py-1.5 px-1 border-2 font-mono text-[10px] text-center ${sel ? "bg-amber-400 text-black border-white font-bold mg-pulse-urgent" : w > 0 ? "bg-hull-800 border-cyan-400 text-cyan-200" : "bg-hull-950 border-slate-700 text-slate-500"}`;
+        const wSpan = document.getElementById(`mg-cb-w-${idx}`);
+        if (wSpan) wSpan.textContent = w > 0 ? `${w}kg` : "—";
+      });
+    }
+    calloutText = d.selectedSlot >= 0
+      ? (isEn ? "CLICK DESTINATION BAY TO SWAP CARGO!" : "CLIQUE NA BAIA DESTINO PARA MOVER A CARGA!")
+      : balanced
+        ? (isEn ? "CENTER OF MASS NOMINAL · HOLD BALANCE!" : "CENTRO DE MASSA ESTÁVEL · MANTENHA!")
+        : (isEn ? "SHIFT CARGO WEIGHTS TO CENTER THE GREEN BEAM!" : "MOVA AS CARGAS PARA NIVELAR NA FAIXA VERDE!");
+
+  } else if (mgState.type === "THERMAL_MANOMETER") {
+    let okCount = 0;
+    const dials = d.dials as { name: string; val: number; tgt: number; drift: number }[];
+    dials.forEach((dial, idx) => {
+      dial.val = Math.max(4, Math.min(96, dial.val + dial.drift * dt * 0.88));
+      if (dial.val >= 94 || dial.val <= 6) dial.drift *= -1;
+      const inRange = Math.abs(dial.val - dial.tgt) <= 12;
+      if (inRange) okCount++;
+      const rot = -110 + (dial.val / 100) * 220;
+      const ptr = document.getElementById(`mg-tm-ptr-${idx}`);
+      const lbl = document.getElementById(`mg-tm-lbl-${idx}`);
+      const vEl = document.getElementById(`mg-tm-val-${idx}`);
+      const card = document.getElementById(`mg-tm-card-${idx}`);
+      if (ptr) {
+        ptr.setAttribute("x2", (40 + Math.sin((rot * Math.PI) / 180) * 22).toFixed(1));
+        ptr.setAttribute("y2", (38 - Math.cos((rot * Math.PI) / 180) * 22).toFixed(1));
+        ptr.setAttribute("stroke", inRange ? "#34d399" : "#fb7185");
+      }
+      if (lbl) lbl.className = `${inRange ? "text-emerald-300" : "text-rose-300"} font-bold truncate`;
+      if (vEl) vEl.textContent = `${Math.round(dial.val)}/${dial.tgt}`;
+      if (card) card.className = `bg-hull-950 border-2 p-1.5 text-center space-y-1 ${inRange ? "border-emerald-500/70" : "border-rose-500/70"}`;
+    });
+    mgState.score = Math.max(0, Math.min(100, mgState.score + (okCount === 3 ? 19 : okCount === 2 ? 5 : -12) * dt));
+    calloutText = isEn
+      ? `VALVES LOCKED: ${okCount}/3 · ALIGN NEEDLES WITH GREEN MARKER!`
+      : `VÁLVULAS TRAVADAS: ${okCount}/3 · ALINHE PONTEIROS NO VERDE!`;
+
+  } else if (mgState.type === "TERMINAL_DIAGNOSTIC") {
+    d.wdTimer = Math.max(0, (d.wdTimer ?? 3.8) - dt);
+    if (d.wdTimer <= 0) {
+      d.wdTimer = 3.8;
+      d.idx = (d.idx + 1) % d.cases.length;
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 10);
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-tdg-err");
+    }
+    const cur = d.cases[d.idx];
+    const errEl = document.getElementById("mg-tdg-err");
+    const wdEl = document.getElementById("mg-tdg-wd");
+    const btnsEl = document.getElementById("mg-tdg-btns");
+    if (errEl && cur) errEl.textContent = isEn ? cur.errEn : cur.errPt;
+    if (wdEl) {
+      wdEl.textContent = `${d.wdTimer.toFixed(1)}s`;
+      wdEl.className = d.wdTimer <= 1.5 ? "shrink-0 text-rose-400 font-bold mg-pulse-urgent" : "shrink-0 text-amber-300 font-bold";
+    }
+    if (btnsEl && cur && btnsEl.getAttribute("data-case") !== String(d.idx)) {
+      btnsEl.setAttribute("data-case", String(d.idx));
+      btnsEl.innerHTML = (cur.opts as string[]).map((op) =>
+        `<button type="button" data-tdgo="${op}" class="pixel-btn py-1.5 px-2 bg-hull-800 text-cyan-300 font-mono text-[10px] font-bold">${op}</button>`
+      ).join("");
+      btnsEl.querySelectorAll("[data-tdgo]").forEach((btn) => {
+        btn.addEventListener("click", () => minigameAction("terminal", btn.getAttribute("data-tdgo"), btn as HTMLElement));
+      });
+    }
+    calloutText = isEn
+      ? `EXECUTE [${cur?.cmd}] BEFORE WATCHDOG (${d.wdTimer.toFixed(1)}s)!`
+      : `EXECUTE [${cur?.cmd}] ANTES DO WATCHDOG (${d.wdTimer.toFixed(1)}s)!`;
+
+  } else if (mgState.type === "BINARY_LOGIC_GATE") {
+    d.gateTime = Math.max(0, (d.gateTime ?? 4.2) - dt);
+    if (d.gateTime <= 0) {
+      const np = d.nextPuzzle();
+      d.target = np.target;
+      d.bits = np.bits;
+      d.gateTime = np.gateTime;
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 10);
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-bg-btns");
+    }
+    const val = d.bits[0] * 8 + d.bits[1] * 4 + d.bits[2] * 2 + d.bits[3];
+    const tgtEl = document.getElementById("mg-bg-tgt");
+    const curEl = document.getElementById("mg-bg-cur");
+    const wdEl = document.getElementById("mg-bg-wd");
+    if (tgtEl) tgtEl.textContent = `0x${d.target.toString(16).toUpperCase()} (${d.target})`;
+    if (curEl) curEl.textContent = `${d.bits.join("")} (${val})`;
+    if (wdEl) {
+      wdEl.textContent = `${d.gateTime.toFixed(1)}s`;
+      wdEl.className = d.gateTime <= 1.5 ? "text-rose-400 font-bold mg-pulse-urgent" : "text-amber-300 font-bold";
+    }
+    const weights = [8, 4, 2, 1];
+    document.querySelectorAll("[data-bg]").forEach((btn, i) => {
+      const on = d.bits[i] === 1;
+      btn.textContent = `[${i + 1}] ${weights[i]}: ${d.bits[i]}`;
+      btn.className = `pixel-btn py-2.5 font-pixel text-[9px] ${on ? "bg-emerald-400 text-black" : "bg-hull-800 text-white"}`;
+    });
+    calloutText = isEn
+      ? `SUM BITS [8·4·2·1] TO ${d.target} BEFORE ${d.gateTime.toFixed(1)}s!`
+      : `SOME BITS [8·4·2·1] ATÉ ${d.target} ANTES DE ${d.gateTime.toFixed(1)}s!`;
+
+  } else if (mgState.type === "TRAJECTORY_LOCK") {
+    const speeds = [88, 108, 126, 142];
+    const spd = speeds[Math.min(3, mgState.valB)];
+    mgState.valA += mgState.vel * spd * dt;
+    if (mgState.valA >= 95) { mgState.valA = 95; mgState.vel = -1; }
+    if (mgState.valA <= 5) { mgState.valA = 5; mgState.vel = 1; }
+    const n = document.getElementById("mg-needle");
+    const inTarget = mgState.valA >= 41 && mgState.valA <= 59;
+    if (n) {
+      n.style.left = `${mgState.valA}%`;
+      n.className = `absolute inset-y-0 w-2 ${inTarget ? "bg-emerald-300 shadow-[0_0_10px_#34d399]" : "bg-cyan-300"}`;
+    }
+    calloutText = inTarget
+      ? (isEn ? "TARGET LOCKED! HIT [SPACE] NOW!" : "ALVO NA MIRA! APERTE [ESPAÇO] AGORA!")
+      : (isEn ? `WAIT FOR CROSSHAIR IN GREEN (${mgState.valB}/4) → [SPACE]` : `AGUARDE NA ZONA VERDE (${mgState.valB}/4) → [ESPAÇO]`);
+
+  } else if (mgState.type === "RING_NAV_CLICK") {
+    d.dist = Math.max(0, d.dist - 46 * dt);
+    if (d.dist <= 0) {
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 12);
+      const nw = d.nextWave();
+      d.safeLane = nw.safeLane;
+      d.dist = nw.dist;
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-rn-lanes");
+    }
+    const cEl = document.getElementById("mg-rn-cleared");
+    if (cEl) cEl.textContent = `${d.cleared} (${Math.ceil(d.dist)}m)`;
+    for (let lane = 0; lane < 4; lane++) {
+      const btn = document.getElementById(`mg-rn-btn-${lane}`);
+      const txt = document.getElementById(`mg-rn-txt-${lane}`);
+      const ind = document.getElementById(`mg-rn-ind-${lane}`);
+      const safe = lane === d.safeLane;
+      if (btn) {
+        btn.className = `relative h-5 border-2 text-left px-2 font-mono text-[10px] flex items-center justify-between ${safe ? "bg-emerald-950/60 border-emerald-400 text-emerald-200 mg-pulse-urgent" : "bg-rose-950/40 border-rose-500/60 text-rose-200"}`;
+      }
+      if (txt) {
+        txt.textContent = `[${lane + 1}] ${safe ? (isEn ? "CLEAR CORRIDOR" : "CORREDOR LIVRE") : (isEn ? "ICE DEBRIS" : "DETRITOS DE GELO")}`;
+      }
+      if (ind) {
+        if (safe) {
+          ind.className = "text-emerald-300 font-bold";
+          ind.style.marginRight = "0px";
+          ind.textContent = "GO";
+        } else {
+          ind.className = "inline-block w-3 h-3 bg-amber-400 border border-rose-200";
+          ind.style.marginRight = `${(Math.max(0, 100 - d.dist) * 0.55).toFixed(1)}px`;
+          ind.textContent = "";
+        }
+      }
+    }
+    calloutText = isEn
+      ? `FAST CLICK LANE [${d.safeLane + 1}] CLEAR!`
+      : `CLIQUE RÁPIDO NA FAIXA [${d.safeLane + 1}] LIVRE!`;
+
+  } else if (mgState.type === "SOLAR_SHIELD_FLUX") {
+    d.solarTarget = Math.round(50 + Math.sin(mgState.timer * 1.65) * 26 + Math.cos(mgState.timer * 2.9) * 14);
+    const diff = Math.abs(d.shieldVal - d.solarTarget);
+    const locked = diff <= 9;
+    mgState.score = Math.max(0, Math.min(100, mgState.score + (locked ? 20 : -12) * dt));
+    const tEl = document.getElementById("mg-sf-tgt");
+    const cEl = document.getElementById("mg-sf-cur");
+    const lEl = document.getElementById("mg-sf-lock");
+    const zEl = document.getElementById("mg-sf-zone");
+    const bEl = document.getElementById("mg-sf-bar");
+    if (tEl) tEl.textContent = `${d.solarTarget}%`;
+    if (cEl) cEl.textContent = `${d.shieldVal}%`;
+    if (lEl) {
+      lEl.textContent = locked ? (isEn ? "LOCKED" : "TRAVADO") : (isEn ? "THERMAL DRIFT!" : "DERIVA TÉRMICA!");
+      lEl.className = locked ? "text-emerald-300 font-bold" : "text-rose-400 font-bold mg-pulse-urgent";
+    }
+    if (zEl) zEl.style.left = `${Math.max(0, Math.min(84, d.solarTarget - 8))}%`;
+    if (bEl) bEl.style.left = `${d.shieldVal}%`;
+    calloutText = isEn
+      ? `DRAG SLIDER TO ${d.solarTarget}% TO BLOCK CORONA FLUX!`
+      : `DESLIZE O ESCUDO ATÉ ${d.solarTarget}% CONTRA A ONDA SOLAR!`;
+
+  } else if (mgState.type === "SPECTROMETER_HARMONIC") {
+    const bands = d.bands as { name: string; val: number; tgt: number; drift: number }[];
+    let synced = 0;
+    bands.forEach((b, idx) => {
+      b.val = Math.max(5, Math.min(95, b.val + (b.drift || 0) * dt));
+      if (b.val <= 6 || b.val >= 94) b.drift = -(b.drift || 4);
+      const ok = Math.abs(b.val - b.tgt) <= 8;
+      if (ok) synced++;
+      const lbl = document.getElementById(`mg-sh-lbl-${idx}`);
+      const cur = document.getElementById(`mg-sh-cur-${idx}`);
+      if (lbl) lbl.className = `w-16 shrink-0 ${ok ? "text-emerald-300 font-bold" : "text-amber-300"}`;
+      if (cur) {
+        cur.style.left = `${b.val}%`;
+        cur.className = `absolute inset-y-0 w-2 ${ok ? "bg-emerald-300" : "bg-cyan-300"}`;
+      }
+    });
+    mgState.score = Math.max(0, Math.min(100, mgState.score + (synced === 3 ? 20 : synced === 2 ? 4 : -10) * dt));
+    calloutText = isEn
+      ? `CHANNELS TUNED: ${synced}/3 · COUNTER DRIFT WITH [-]/[+]!`
+      : `CANAIS SINTONIZADOS: ${synced}/3 · COMPENSE A DERIVA COM [-]/[+]!`;
+
+  } else if (mgState.type === "COOLANT_MATRIX") {
+    d.nodeTime = Math.max(0, (d.nodeTime ?? 4.0) - dt);
+    if (d.nodeTime <= 0) {
+      d.nodeTime = 4.0;
+      d.hotIdx = (d.hotIdx + 1) % d.nodes.length;
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 10);
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-rc-hot");
+    }
+    const hotEl = document.getElementById("mg-rc-hot");
+    const tEl = document.getElementById("mg-rc-timer");
+    const stTxt = document.getElementById("mg-rc-st");
+    const targetNode = d.nodes[d.hotIdx];
+    if (hotEl) hotEl.textContent = targetNode.label;
+    if (tEl) {
+      tEl.textContent = `${d.nodeTime.toFixed(1)}s`;
+      tEl.className = d.nodeTime <= 1.5 ? "text-rose-400 font-bold mg-pulse-urgent" : "text-amber-300 font-bold";
+    }
+    if (stTxt) {
+      const activeList = (d.valves as boolean[]).map((v, i) => (v ? `V${i + 1}` : "")).filter(Boolean).join("+");
+      stTxt.textContent = `${isEn ? "ACTIVE:" : "ATIVAS:"} ${activeList || (isEn ? "NONE" : "NENHUMA")}`;
+    }
+    document.querySelectorAll("[data-rc]").forEach((btn, idx) => {
+      btn.className = `pixel-btn py-2.5 font-pixel text-[9px] ${d.valves[idx] ? "bg-emerald-400 text-black" : "bg-hull-800 text-slate-200"}`;
+    });
+    calloutText = isEn
+      ? `ROUTE ${targetNode.label} BEFORE ${d.nodeTime.toFixed(1)}s!`
+      : `ROTEIE ${targetNode.label} ANTES DE ${d.nodeTime.toFixed(1)}s!`;
+
+  } else if (mgState.type === "GRAVITY_SLINGSHOT") {
+    const orbitSpeed = 175 + d.burns * 25;
+    d.angleDeg = (d.angleDeg + orbitSpeed * dt) % 360;
+    const rad = (d.angleDeg * Math.PI) / 180;
+    const inArc = d.angleDeg >= 322 || d.angleDeg <= 38;
+    const probe = document.getElementById("mg-gs-probe");
+    if (probe) {
+      probe.setAttribute("cx", (56 + Math.cos(rad) * 44).toFixed(1));
+      probe.setAttribute("cy", (34 + Math.sin(rad) * 24).toFixed(1));
+      probe.setAttribute("fill", inArc ? "#34d399" : "#38bdf8");
+    }
+    calloutText = inArc
+      ? (isEn ? `IN GOLD ARC! HIT [SPACE] (${d.burns}/4)!` : `NO ARCO DOURADO! DISPARE [ESPAÇO] (${d.burns}/4)!`)
+      : (isEn ? `WAIT FOR GOLD PERIAPSIS (${d.burns}/4) → [SPACE]` : `AGUARDE NO ARCO DOURADO (${d.burns}/4) → [ESPAÇO]`);
+
+  } else if (mgState.type === "OPTICAL_RING_LOCK") {
+    let lockedCount = 0;
+    for (let i = 0; i < 4; i++) {
+      const btn = document.getElementById(`mg-lo-${i}`);
+      const txt = document.getElementById(`mg-lo-txt-${i}`);
+      const hex = document.getElementById(`mg-lo-hex-${i}`);
+      const ok = d.angles[i] === 0;
+      if (ok) lockedCount++;
+      if (txt) txt.textContent = `S${i + 1}: ${d.angles[i]}°`;
+      if (hex) hex.setAttribute("transform", `rotate(${d.angles[i]} 20 20)`);
+      if (btn) btn.className = `pixel-btn py-1.5 px-1 font-pixel text-[8px] flex flex-col items-center gap-1 ${ok ? "bg-emerald-400 text-black" : "bg-hull-800 text-amber-300"}`;
+    }
+    calloutText = isEn
+      ? `MIRRORS LOCKED: ${lockedCount}/4 · ROTATE ALL HEX SEGMENTS TO 0°!`
+      : `ESPELHOS TRAVADOS: ${lockedCount}/4 · GIRE TODOS PARA 0°!`;
+
+  } else if (mgState.type === "MORSE_BEACON_SYNC") {
+    d.pktTime = Math.max(0, (d.pktTime ?? 5.5) - dt);
+    if (d.pktTime <= 0) {
+      d.pattern = d.nextCode();
+      d.idx = 0;
+      d.pktTime = 5.5;
+      mgState.errors += 1;
+      mgState.score = Math.max(0, mgState.score - 9);
+      audio.alarm();
+      triggerMgFeedback(false, "#mg-mb-pat");
+    }
+    const patEl = document.getElementById("mg-mb-pat");
+    const wdEl = document.getElementById("mg-mb-wd");
+    const prEl = document.getElementById("mg-mb-prog");
+    const nextSym = d.pattern[d.idx];
+    if (patEl) {
+      patEl.innerHTML = (d.pattern as string[]).map((sym, i) =>
+        i < d.idx
+          ? `<span class="text-emerald-400">${sym}</span>`
+          : i === d.idx
+            ? `<span class="text-white bg-amber-500/40 px-1 border border-amber-300">${sym}</span>`
+            : `<span>${sym}</span>`
+      ).join(" ");
+    }
+    if (wdEl) {
+      wdEl.textContent = `${d.pktTime.toFixed(1)}s`;
+      wdEl.className = d.pktTime <= 2.0 ? "text-xs text-rose-400 font-bold mg-pulse-urgent" : "text-xs text-amber-300 font-bold";
+    }
+    if (prEl) prEl.textContent = `${d.idx}/${d.pattern.length}`;
+    calloutText = nextSym === "•"
+      ? (isEn ? "NEXT PULSE: [Z] • SHORT DOT!" : "PRÓXIMO PULSO: [Z] • CURTO!")
+      : (isEn ? "NEXT PULSE: [X] — LONG DASH!" : "PRÓXIMO PULSO: [X] — LONGO!");
+
+  } else if (mgState.type === "CORE_OVERRIDE") {
+    if (d.phase === 1) {
+      const stEl = document.getElementById("mg-co-p1st");
+      if (stEl) stEl.textContent = d.bits.join(" ");
+      document.querySelectorAll("[data-co-bit]").forEach((btn, idx) => {
+        const on = d.bits[idx] === 1;
+        btn.textContent = `K${idx + 1}: ${d.bits[idx]}`;
+        btn.className = `pixel-btn py-2.5 font-pixel text-[9px] ${on ? "bg-emerald-400 text-black" : "bg-hull-800 text-white"}`;
+      });
+      calloutText = isEn
+        ? `PHASE 1: SET LOCKS TO ${d.targetBits.join(" ")}!`
+        : `FASE 1: AJUSTE AS TRAVAS PARA ${d.targetBits.join(" ")}!`;
+    } else if (d.phase === 2) {
+      d.meco += d.mecoVel * 115 * dt;
+      if (d.meco >= 95) { d.meco = 95; d.mecoVel = -1; }
+      if (d.meco <= 5) { d.meco = 5; d.mecoVel = 1; }
+      const n = document.getElementById("mg-needle");
+      if (n) n.style.left = `${d.meco}%`;
+      calloutText = isEn ? "PHASE 2: HIT [SPACE] IN GREEN FOR MECO!" : "FASE 2: APERTE [ESPAÇO] NO VERDE PARA CORTE MECO!";
+    } else if (d.phase === 3) {
+      const n = document.getElementById("mg-needle");
+      if (n) n.style.left = `${Math.min(95, (d.retro / 8) * 95)}%`;
+      calloutText = isEn ? `PHASE 3: TAP [SPACE] RAPIDLY (${d.retro}/8)!` : `FASE 3: CLIQUE RÁPIDO [ESPAÇO] (${d.retro}/8)!`;
+    }
+  }
+
+  if (calloutEl && calloutText && calloutText !== lastMgCallout) {
+    lastMgCallout = calloutText;
+    calloutEl.textContent = calloutText;
+  }
+  if (stEl) {
+    const nextSt = `${t("syncLabel")} ${Math.round(mgState.score)}%`;
+    if (nextSt !== lastMgStatus) {
+      lastMgStatus = nextSt;
+      stEl.textContent = nextSt;
+    }
+  }
+  stepAndDrawMgFx(dt);
+  if (visor) {
+    const syncBonus = Math.round((mgState.score / 100) * 50);
+    const flawlessBonus =
+      mgState.errors === 0 && mgState.score >= 90
+        ? 25
+        : mgState.errors === 0 && mgState.score >= 75
+          ? 15
+          : mgState.errors === 1 && mgState.score >= 90
+            ? 10
+            : 0;
+    visor.flight.bonusPct = syncBonus + flawlessBonus;
+  }
+}
+
+export function finishMissionMinigameAndEvaluate() {
+  mgState.active = false;
+  clearMgFx();
+  document.getElementById("minigame-hud")?.classList.add("hidden");
+
+  const visor = hooks?.getVisor3D();
+  if (!visor) return;
+  const m = computeMetrics();
+  const bonus = visor.flight.bonusPct;
+  const effectiveRel = Math.min(0.99, m.vehicle.reliability + (mgState.score >= 70 ? 0.04 : -0.05));
+  if (Math.random() <= effectiveRel) {
+    visor.enterOrbit();
+    audio.success();
+    hooks?.completeMissionSuccess(bonus, mgState.errors);
+  } else {
+    visor.fail();
+    audio.alarm();
+    const isEn = getLang() === "en";
+    hooks?.completeMissionFailure(
+      isEn
+        ? `Statistical propulsion failure (Reliability ${(m.vehicle.reliability * 100).toFixed(0)}%). Try again!`
+        : `Falha estatística de propulsão (Confiabilidade ${(m.vehicle.reliability * 100).toFixed(0)}%). Tente novamente!`
+    );
+  }
+  hooks?.syncFlightTelemetry();
+}
+
+let crtRafId: number | null = null;
+
+export function cleanupCRT() {
+  if (crtRafId !== null) {
+    cancelAnimationFrame(crtRafId);
+    crtRafId = null;
+  }
+}
+
+export function typewriteCRT(code: string, text: string) {
+  const out = document.getElementById("crt-output");
+  const idEl = document.getElementById("crt-code-id");
+  if (!out) return;
+  if (idEl) idEl.textContent = code;
+  cleanupCRT();
+  out.textContent = "";
+  let i = 0;
+  const step = () => {
+    const nextIdx = Math.min(text.length, i + 10);
+    out.textContent = text.slice(0, nextIdx);
+    i = nextIdx;
+    audio.typeClick();
+    if (i < text.length) {
+      crtRafId = requestAnimationFrame(step);
+    } else {
+      crtRafId = null;
+    }
+  };
+  crtRafId = requestAnimationFrame(step);
+}
+
+export type InspectableItem = LaunchVehicle | SpaceBus | SpaceInstrument | GroundStation;
+
+export function inspectItemOnCRT(kind: string, item: InspectableItem | undefined) {
+  if (!item) return;
+  const missionId = getMission().id;
+  hooks?.onInspectItem?.(kind, item.id, missionId);
+
+  const mNum = missionId.match(/m(\d+)/)?.[1]?.padStart(2, "0") || "01";
+  const previewTag = document.getElementById("preview-3d-tag");
+  if (previewTag) previewTag.textContent = `M${mNum} · ${item.id.toUpperCase()}`;
+
+  const isEn = getLang() === "en";
+  const locale = isEn ? "en-US" : "pt-BR";
+  const segName =
+    kind === "Instrumento" && isEn
+      ? "INSTRUMENT"
+      : kind.toUpperCase();
+
+  let locName = item.name;
+  let locDesc = item.desc;
+  const lines: string[] = [];
+
+  if (kind === "Launch Segment") {
+    const v = getLocVehicle(item as LaunchVehicle);
+    locName = v.name;
+    locDesc = v.desc;
+    lines.push(
+      `> ${isEn ? "SEGMENT" : "SEGMENTO"}: ${segName}`,
+      `> ${isEn ? "ITEM" : "ITEM"}: ${locName}`,
+      `------------------------------------`,
+      `${isEn ? "COST" : "CUSTO"}         : ${formatUsd(v.cost)}`,
+      `${isEn ? "MAX PAYLOAD" : "CARGA MÁXIMA"}  : ${v.payload_max_kg.toLocaleString(locale)} kg`,
+      `${isEn ? "SPECIFIC IMP." : "IMPULSO ESP."}  : ${v.isp_s || 348} s`,
+      `${isEn ? "RELIABILITY" : "CONFIABILIDADE"}: ${(v.reliability * 100).toFixed(0)}%`
+    );
+  } else if (kind === "Space Bus") {
+    const b = getLocBus(item as SpaceBus);
+    locName = b.name;
+    locDesc = b.desc;
+    const radTier = b.radTier || 1;
+    lines.push(
+      `> ${isEn ? "SEGMENT" : "SEGMENTO"}: ${segName}`,
+      `> ${isEn ? "ITEM" : "ITEM"}: ${locName}`,
+      `------------------------------------`,
+      `${isEn ? "COST" : "CUSTO"}         : ${formatUsd(b.cost)}`,
+      `${isEn ? "DRY MASS" : "MASSA SECA"}    : ${b.dry_mass_kg.toLocaleString(locale)} kg`,
+      `${isEn ? "POWER GEN." : "GERAÇÃO SOLAR"} : ${b.power_gen_w.toLocaleString(locale)} W`,
+      `${isEn ? "RAD SHIELDING" : "BLINDAGEM RAD"} : TIER ${radTier}`
+    );
+  } else if (kind === "Instrumento") {
+    const inst = getLocInstrument(item as SpaceInstrument);
+    locName = inst.name;
+    locDesc = inst.desc;
+    lines.push(
+      `> ${isEn ? "SEGMENT" : "SEGMENTO"}: ${segName}`,
+      `> ${isEn ? "ITEM" : "ITEM"}: ${locName}`,
+      `------------------------------------`,
+      `${isEn ? "COST" : "CUSTO"}         : ${formatUsd(inst.cost)}`,
+      `${isEn ? "MASS / POWER" : "MASSA / POT."}  : ${inst.mass_kg} kg / ${inst.power_w} W`,
+      `${isEn ? "SCIENCE" : "CIÊNCIA"}       : +${inst.science_pts} pts`,
+      `${isEn ? "WAVELENGTH" : "COMPR. ONDA"}   : ${inst.wavelength}`
+    );
+  } else {
+    const gs = getLocGround(item as GroundStation);
+    locName = gs.name;
+    locDesc = gs.desc;
+    lines.push(
+      `> ${isEn ? "SEGMENT" : "SEGMENTO"}: ${segName}`,
+      `> ${isEn ? "ITEM" : "ITEM"}: ${locName}`,
+      `------------------------------------`,
+      `${isEn ? "OPS COST" : "CUSTO OPS"}      : ${formatUsd(gs.cost)}`,
+      `${isEn ? "BAND / LINK" : "BANDA / LINK"}  : ${gs.band}`
+    );
+  }
+  lines.push(`------------------------------------`, locDesc);
+  typewriteCRT(item.id.toUpperCase(), lines.join("\n"));
+}

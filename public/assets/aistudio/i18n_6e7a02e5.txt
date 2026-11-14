@@ -1,0 +1,769 @@
+export type Language = "pt" | "en";
+
+const LANG_STORAGE_KEY = "projeto_ad_estrelas_lang";
+
+let currentLang: Language = (() => {
+  try {
+    const saved = localStorage.getItem(LANG_STORAGE_KEY);
+    if (saved === "en" || saved === "pt") return saved;
+  } catch {
+    /* ignore storage errors */
+  }
+  return "en";
+})();
+
+const listeners = new Set<(lang: Language) => void>();
+
+export function getLang(): Language {
+  return currentLang;
+}
+
+export function setLang(lang: Language) {
+  if (lang !== "pt" && lang !== "en") return;
+  if (currentLang === lang) return;
+  currentLang = lang;
+  try {
+    localStorage.setItem(LANG_STORAGE_KEY, lang);
+  } catch {
+    /* ignore storage errors */
+  }
+  document.documentElement.lang = lang === "pt" ? "pt-BR" : "en";
+  listeners.forEach((cb) => cb(lang));
+}
+
+export function toggleLang() {
+  setLang(currentLang === "pt" ? "en" : "pt");
+}
+
+export function onLangChange(cb: (lang: Language) => void): () => void {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
+}
+
+export const UI_STRINGS = {
+  pt: {
+    brand: "PROJETO AD ESTRELAS",
+    navHub: "BASE",
+    navQuests: "QUESTS",
+    navWorkbench: "BANCADA",
+    navConsole: "CONSOLE 3D",
+    navTrophies: "TROFÉUS",
+    sfxOn: "SOM: ON",
+    sfxOff: "SOM: OFF",
+    settingsBtn: "CONFIG",
+    telemetryAria: "Resumo dos 4 Segmentos NASA",
+    userSegmentActive: "User Segment · Missão Ativa",
+    budgetPayload: "Orçamento / Carga Útil",
+    powerScience: "Energia / Ciência",
+    careerSpaceBase: "Carreira & Base Espacial",
+    commandCenterTitle: "CENTRO DE CONTROLE NASA · 2.5D",
+    controlsMove: "WASD / Setas / Clique: Mover",
+    controlsInteract: "E: Interagir",
+    openStation: "Abrir Estação",
+    accessBtn: "ACESSAR",
+    station01Tag: "Estação 01 · CML",
+    station01Title: "MURAL DE QUESTS",
+    station02Tag: "Estação 02 · CRT",
+    station02Title: "BANCADA NASA",
+    station03Tag: "Estação 03 · PS1",
+    station03Title: "CONSOLE 3D",
+    station04Tag: "Estação 04 · Hall",
+    station04Title: "TROFÉUS & RANK",
+    station05Tag: "Estação 05 · Skins",
+    station05Title: "ARMÁRIO DE TRAJES",
+    tabQuests: "QUESTS",
+    tabWorkbench: "BANCADA",
+    tabConsole: "CONSOLE 3D",
+    tabTrophies: "TROFÉUS",
+    tabSuits: "TRAJES",
+    exitEsc: "SAIR [ESC]",
+    questsHeader: "DIRETRIZES NASA · CONCEPT MATURITY LEVELS",
+    questsQuote:
+      "Dr. Sagan-Silva: \"Cada nível CML exige trade studies reais entre orçamento, banda espectral e massa. Selecione sua missão para configurar os 4 Segmentos.\"",
+    completedLabel: "CONCLUÍDAS:",
+    seg1Title: "1. LAUNCH SEGMENT (VEÍCULO LANÇADOR)",
+    seg1Hint: "Passe o mouse ou clique para inspecionar no CRT & 3D",
+    seg2aTitle: "2A. SPACE SEGMENT (PLATAFORMA / BUS)",
+    seg2aHint: "Massa seca & Geração solar/nuclear",
+    seg2bTitle: "2B. SPACE SEGMENT (INSTRUMENTOS CIENTÍFICOS)",
+    seg2bHint: "Combine sensores p/ atingir ciência & banda",
+    seg3Title: "3. GROUND SEGMENT",
+    seg4Title: "4. USER SEGMENT (OBJETIVO)",
+    crtTechSpec: "CRT-NASA · PREVIEW 3D & FICHA",
+    sysBalance: "BALANÇO DE SISTEMAS",
+    totalBudget: "Orçamento Total",
+    payloadVsLauncher: "Massa Carga Útil vs Lançador",
+    powerDrawVsGen: "Energia (Consumo vs Geração)",
+    totalScience: "Ciência Total",
+    requiredBand: "Banda Espectral Exigida",
+    goToPadBtn: "IR PARA PLATAFORMA 3D >",
+    visorTitle: "NASA MISSION VIZ · 320×240 PS1",
+    camPlatform: "CÂMERA: PLATAFORMA",
+    camChase: "CÂMERA: PERSEGUIÇÃO",
+    camPanorama: "CÂMERA: PANORÂMICA",
+    camPayload: "CÂMERA: CARGA ÚTIL",
+    altLabel: "ALT:",
+    velLabel: "VEL:",
+    accelLabel: "ACEL:",
+    switchCam: "TROCAR CÂMERA",
+    visorFooter: "Dither 15-bit · Scanlines CRT · Trajetória 3D",
+    flightDirector: "DIRETOR DE VOO · GO / NO-GO",
+    stagePropellant: "Propelente do Estágio",
+    missionProtocol: "Protocolo de Voo da Missão",
+    startLaunch: "INICIAR LANÇAMENTO",
+    resetBtn: "RESET",
+    telemetryLog: "LOG DE TELEMETRIA",
+    bonusTag: "BÔNUS:",
+    padReadyLog: "Plataforma pronta. Aguardando autorização.",
+    padSyncedLog: "Plataforma sincronizada com os 4 segmentos atuais.",
+    padResetLog: "Plataforma reiniciada.",
+    careerRankLabel: "Patente de Carreira NASA",
+    callsignLabel: "Indicativo:",
+    baseLvl1: "Base Nível 1",
+    baseLvl1Name: "Bunker Rústico",
+    baseLvl2: "Base Nível 2",
+    baseLvl2Req: "1+ Missão",
+    baseLvl3: "Base Nível 3",
+    baseLvl3Req: "3+ Missões",
+    historyTitle: "HISTÓRICO DE MISSÕES (LOCALSTORAGE)",
+    clearBtn: "Limpar",
+    tblCallsign: "Indicativo",
+    tblMission: "Missão",
+    tblCost: "Custo",
+    tblScore: "Pontos",
+    noRecords: "Sem lançamentos registrados.",
+    trophyHallTitle: "SALA DE TROFÉUS 3D",
+    trophyLocked: "TROFÉU BLOQUEADO",
+    trophyLockedDesc: "Conclua a missão correspondente para desbloquear esta miniatura 3D na prateleira.",
+    wardrobeTitle: "LOJA & ARMÁRIO DE TRAJES NASA",
+    wardrobeDesc:
+      "Conclua missões para ganhar Créditos NASA, desbloquear réplicas históricas de voo e equipar seu engenheiro na base.",
+    creditsLabel: "CRÉDITOS NASA:",
+    equippedLabel: "Equipado:",
+    previewHeader: "CRT-3D · PREVIEW",
+    previewDrag: "ARRASTE",
+    settingsTitle: "CONFIGURAÇÕES DO SISTEMA",
+    settingsLangLabel: "Idioma / Language",
+    settingsSfxLabel: "Efeitos Sonoros (Audio Web)",
+    settingsCrtLabel: "Filtro CRT Global (Scanlines)",
+    settingsCallsignLabel: "Indicativo do Comandante",
+    settingsClose: "FECHAR",
+    on: "ATIVADO",
+    off: "DESATIVADO",
+    langCornerTitle: "IDIOMA",
+    approved: "APROVADO",
+    pending: "PENDENTE",
+    ok: "OK",
+    missing: "Falta",
+    completed: "CONCLUÍDA",
+    available: "DISPONÍVEL",
+    selectedGoWb: "SELECIONADA · IR À BANCADA",
+    activateMission: "ATIVAR MISSÃO",
+    nasaRef: "Ref. NASA:",
+    budgetShort: "Orçamento",
+    minScienceShort: "Ciência Mín",
+    bandShort: "Banda",
+    payloadLabel: "Carga:",
+    relLabel: "Conf.:",
+    dryMassLabel: "Massa Seca:",
+    energyLabel: "Energia:",
+    scienceGoal: "Meta Científica:",
+    requiredBandGoal: "Banda Exigida:",
+    protocolGoal: "Protocolo:",
+    baseSupremo: "Base Nv. Supremo",
+    baseLvlPrefix: "Base Nv.",
+    evoSupreme: "Nível Supremo: Comando Interestelar NASA (15 Missões)",
+    evo1: "Nível 1: Bunker Rústico (Iluminação Âmbar de Emergência)",
+    evo2: "Nível 2: Ala Expandida, Protótipos & Primeiro Troféu 3D",
+    evo3: "Nível 3: Complexo Tecnológico Avançado (LEDs & Cientistas Reativos)",
+    checkBudget: "Orçamento",
+    checkMass: "Massa Máx",
+    checkPower: "Energia",
+    checkSciBand: "Ciência/Banda",
+    pendingReqs: "REQUISITOS PENDENTES",
+    inOrbitBtn: "MISSÃO EM ÓRBITA",
+    inFlightBtn: "EM VOO",
+    phasePad: "PRÉ-LANÇAMENTO",
+    phaseAscent: "ASCENSÃO ORBITAL",
+    phaseOrbit: "ÓRBITA ESTÁVEL",
+    phaseFailed: "ABORTADA",
+    launchAuth: "Autorização concedida:",
+    orbitSuccessTitle: "ÓRBITA ALCANÇADA · SUCESSO",
+    missionAbortedTitle: "MISSÃO ABORTADA",
+    unlocked: "DESBLOQUEADO",
+    locked: "BLOQUEADO",
+    nextRankPrefix: "Próxima:",
+    maxRankReached: "Patente Máxima NASA Alcançada",
+    freeTag: "GRÁTIS",
+    ownedTag: "ADQUIRIDO",
+    equippedSuitBtn: "EQUIPADO NA BASE",
+    equipSuitBtn: "EQUIPAR TRAJE",
+    buySuitBtn: "COMPRAR",
+    lockedSuitBtn: "BLOQUEADO",
+    expansionLocked: "EXPANSÃO BLOQUEADA",
+    expansionUnlock: "CONCLUA 1 MISSÃO",
+    replayTag: "Rejogo",
+    newMissionTag: "Inédita (100%)",
+    statScience: "Ciência",
+    statCmlMult: "Mult. CML",
+    statBudgetEff: "Econ. Orçamento",
+    statNasaPrecision: "Precisão NASA",
+    statMinigame: "Minigame",
+    statSubsidy: "Subsídio NASA",
+    statRate: "Taxa Missão",
+    flawlessTag: "PERFEITO",
+    syncLabel: "SINCRONIA:",
+    physSimTitle: "SIMULADOR DE GRAVIDADE & AJUSTE PRÉ-VOO",
+    physPresetEarth: "TERRA 1.0G",
+    physPresetUpper: "ATMOSF. SUP.",
+    physPresetLunar: "LUNAR 0.16G",
+    physPresetMicro: "MICRO-G 0.05",
+    physGravityLabel: "Gravidade Local (G)",
+    physAtmLabel: "Densidade Atmosférica",
+    physDragLabel: "Arrasto Aerodinâmico (Cd)",
+    physThrottleLabel: "Calibração de Empuxo (%)",
+    physWeightLabel: "Peso Aparente",
+    physThrustReqLabel: "Empuxo Necessário",
+    physThrustAvailLabel: "Empuxo Calibrado",
+    physTwrLabel: "Razão TWR",
+    physDragPeakLabel: "Arrasto Máx-Q",
+    physApogeeLabel: "Apogeu Est.",
+    physCalibratedGo: "CALIBRAÇÃO NOMINAL · GO",
+    physCalibratedWarn: "MAX-Q ELEVADO · AJUSTE",
+    physNoGoThrust: "EMPUXO INSUFICIENTE",
+    physTrajCaption: "TRAJETÓRIA BALÍSTICA & VETORES",
+    checkPhysics: "Física TWR",
+    physVectorThrust: "EMPUXO",
+    physVectorWeight: "PESO",
+    physVectorDrag: "ARRASTO",
+    physStabilityLabel: "ESTABILIDADE NASA",
+    physStableIdeal: "IDEAL · NORMA NASA OK",
+    physStableDrift: "DERIVA · AJUSTE FINO",
+    physStableDanger: "INSTÁVEL · FORA DA NORMA",
+    physTargetTag: "ALVO NASA:",
+    physReseedBtn: "RETESTAR DESVIO",
+    physNoGoCalib: "CALIBRE GRAVIDADE/ATM",
+    physDeltaVLabel: "Δv Est.",
+    physRefTrajLegend: "TRACEJADO = CORREDOR NASA",
+    wbImpactTitle: "MATRIZ TÁTICA DE IMPACTO NASA",
+    wbViabilityLabel: "VIABILIDADE DE MISSÃO",
+    wbHoverPreviewTag: "SIMULAÇÃO AO PASSAR O MOUSE",
+    wbImpactBudget: "ORÇAMENTO",
+    wbImpactMass: "CARGA / MASSA",
+    wbImpactPower: "ENERGIA BUS",
+    wbImpactScience: "META CIENTÍFICA",
+    wbIspLabel: "Isp:",
+    wbCostOpsLabel: "Ops:",
+    wbGroundSegmentCost: "Operação Rede Terrestre (SCaN)"
+  },
+  en: {
+    brand: "PROJECT AD ESTRELAS",
+    navHub: "HUB",
+    navQuests: "QUESTS",
+    navWorkbench: "WORKBENCH",
+    navConsole: "3D CONSOLE",
+    navTrophies: "TROPHIES",
+    sfxOn: "SFX: ON",
+    sfxOff: "SFX: OFF",
+    settingsBtn: "SETTINGS",
+    telemetryAria: "4 NASA Segments Summary",
+    userSegmentActive: "User Segment · Active Mission",
+    budgetPayload: "Budget / Payload Mass",
+    powerScience: "Power / Science",
+    careerSpaceBase: "Career & Space Base",
+    commandCenterTitle: "NASA COMMAND CENTER · 2.5D",
+    controlsMove: "WASD / Arrows / Click: Move",
+    controlsInteract: "E: Interact",
+    openStation: "Open Station",
+    accessBtn: "ACCESS",
+    station01Tag: "Station 01 · CML",
+    station01Title: "QUEST BOARD",
+    station02Tag: "Station 02 · CRT",
+    station02Title: "NASA WORKBENCH",
+    station03Tag: "Station 03 · PS1",
+    station03Title: "3D CONSOLE",
+    station04Tag: "Station 04 · Hall",
+    station04Title: "TROPHIES & RANK",
+    station05Tag: "Station 05 · Skins",
+    station05Title: "SUIT LOCKER",
+    tabQuests: "QUESTS",
+    tabWorkbench: "WORKBENCH",
+    tabConsole: "3D CONSOLE",
+    tabTrophies: "TROPHIES",
+    tabSuits: "SUITS",
+    exitEsc: "EXIT [ESC]",
+    questsHeader: "NASA GUIDELINES · CONCEPT MATURITY LEVELS",
+    questsQuote:
+      "Dr. Sagan-Silva: \"Each CML level requires real trade studies across budget, spectral band, and mass. Select your mission to configure the 4 Segments.\"",
+    completedLabel: "COMPLETED:",
+    seg1Title: "1. LAUNCH SEGMENT (LAUNCH VEHICLE)",
+    seg1Hint: "Hover or click to inspect in CRT & 3D",
+    seg2aTitle: "2A. SPACE SEGMENT (SPACECRAFT BUS)",
+    seg2aHint: "Dry mass & Solar/nuclear generation",
+    seg2bTitle: "2B. SPACE SEGMENT (SCIENCE INSTRUMENTS)",
+    seg2bHint: "Combine sensors to meet science & band",
+    seg3Title: "3. GROUND SEGMENT",
+    seg4Title: "4. USER SEGMENT (OBJECTIVE)",
+    crtTechSpec: "CRT-NASA · 3D PREVIEW & SPEC",
+    sysBalance: "SYSTEMS BALANCE",
+    totalBudget: "Total Budget",
+    payloadVsLauncher: "Payload Mass vs Launcher",
+    powerDrawVsGen: "Power (Draw vs Generation)",
+    totalScience: "Total Science",
+    requiredBand: "Required Spectral Band",
+    goToPadBtn: "GO TO 3D LAUNCH PAD >",
+    visorTitle: "NASA MISSION VIZ · 320×240 PS1",
+    camPlatform: "CAMERA: LAUNCH PAD",
+    camChase: "CAMERA: CHASE",
+    camPanorama: "CAMERA: PANORAMIC",
+    camPayload: "CAMERA: PAYLOAD",
+    altLabel: "ALT:",
+    velLabel: "VEL:",
+    accelLabel: "ACCEL:",
+    switchCam: "SWITCH CAMERA",
+    visorFooter: "15-bit Dither · CRT Scanlines · 3D Trajectory",
+    flightDirector: "FLIGHT DIRECTOR · GO / NO-GO",
+    stagePropellant: "Stage Propellant",
+    missionProtocol: "Mission Flight Protocol",
+    startLaunch: "START LAUNCH",
+    resetBtn: "RESET",
+    telemetryLog: "TELEMETRY LOG",
+    bonusTag: "BONUS:",
+    padReadyLog: "Launch pad ready. Awaiting authorization.",
+    padSyncedLog: "Launch pad synchronized with current 4 segments.",
+    padResetLog: "Launch pad reset.",
+    careerRankLabel: "NASA Career Rank",
+    callsignLabel: "Callsign:",
+    baseLvl1: "Base Level 1",
+    baseLvl1Name: "Rustic Bunker",
+    baseLvl2: "Base Level 2",
+    baseLvl2Req: "1+ Mission",
+    baseLvl3: "Base Level 3",
+    baseLvl3Req: "3+ Missions",
+    historyTitle: "MISSION HISTORY (LOCALSTORAGE)",
+    clearBtn: "Clear",
+    tblCallsign: "Callsign",
+    tblMission: "Mission",
+    tblCost: "Cost",
+    tblScore: "Score",
+    noRecords: "No launches recorded yet.",
+    trophyHallTitle: "3D TROPHY HALL",
+    trophyLocked: "TROPHY LOCKED",
+    trophyLockedDesc: "Complete the corresponding mission to unlock this 3D shelf miniature.",
+    wardrobeTitle: "NASA SUIT SHOP & LOCKER",
+    wardrobeDesc:
+      "Complete missions to earn NASA Credits, unlock historic flight replicas, and equip your base engineer.",
+    creditsLabel: "NASA CREDITS:",
+    equippedLabel: "Equipped:",
+    previewHeader: "CRT-3D · PREVIEW",
+    previewDrag: "DRAG",
+    settingsTitle: "SYSTEM SETTINGS",
+    settingsLangLabel: "Language / Idioma",
+    settingsSfxLabel: "Sound Effects (Web Audio)",
+    settingsCrtLabel: "Global CRT Filter (Scanlines)",
+    settingsCallsignLabel: "Commander Callsign",
+    settingsClose: "CLOSE",
+    on: "ENABLED",
+    off: "DISABLED",
+    langCornerTitle: "LANG",
+    approved: "APPROVED",
+    pending: "PENDING",
+    ok: "OK",
+    missing: "Missing",
+    completed: "COMPLETED",
+    available: "AVAILABLE",
+    selectedGoWb: "SELECTED · WORKBENCH",
+    activateMission: "ACTIVATE MISSION",
+    nasaRef: "NASA Ref:",
+    budgetShort: "Budget",
+    minScienceShort: "Min Science",
+    bandShort: "Band",
+    payloadLabel: "Payload:",
+    relLabel: "Rel.:",
+    dryMassLabel: "Dry Mass:",
+    energyLabel: "Power:",
+    scienceGoal: "Science Target:",
+    requiredBandGoal: "Required Band:",
+    protocolGoal: "Protocol:",
+    baseSupremo: "Base Lv. Supreme",
+    baseLvlPrefix: "Base Lv.",
+    evoSupreme: "Supreme Level: NASA Interstellar Command (15 Missions)",
+    evo1: "Level 1: Rustic Bunker (Amber Emergency Lighting)",
+    evo2: "Level 2: Expanded Wing, Prototypes & First 3D Trophy",
+    evo3: "Level 3: Advanced Tech Complex (LEDs & Reactive Scientists)",
+    checkBudget: "Budget",
+    checkMass: "Max Mass",
+    checkPower: "Power",
+    checkSciBand: "Science/Band",
+    pendingReqs: "PENDING REQUIREMENTS",
+    inOrbitBtn: "IN ORBIT",
+    inFlightBtn: "IN FLIGHT",
+    phasePad: "PRE-LAUNCH",
+    phaseAscent: "ORBITAL ASCENT",
+    phaseOrbit: "STABLE ORBIT",
+    phaseFailed: "ABORTED",
+    launchAuth: "Authorization granted:",
+    orbitSuccessTitle: "ORBIT ACHIEVED · SUCCESS",
+    missionAbortedTitle: "MISSION ABORTED",
+    unlocked: "UNLOCKED",
+    locked: "LOCKED",
+    nextRankPrefix: "Next:",
+    maxRankReached: "Maximum NASA Rank Reached",
+    freeTag: "FREE",
+    ownedTag: "OWNED",
+    equippedSuitBtn: "EQUIPPED ON BASE",
+    equipSuitBtn: "EQUIP SUIT",
+    buySuitBtn: "BUY",
+    lockedSuitBtn: "LOCKED",
+    expansionLocked: "EXPANSION LOCKED",
+    expansionUnlock: "COMPLETE 1 MISSION",
+    replayTag: "Replay",
+    newMissionTag: "First Clear (100%)",
+    statScience: "Science",
+    statCmlMult: "CML Mult.",
+    statBudgetEff: "Budget Eff.",
+    statNasaPrecision: "NASA Precision",
+    statMinigame: "Minigame",
+    statSubsidy: "NASA Grant",
+    statRate: "Payout Rate",
+    flawlessTag: "FLAWLESS",
+    syncLabel: "SYNC:",
+    physSimTitle: "GRAVITY & PRE-FLIGHT PHYSICS SIMULATOR",
+    physPresetEarth: "EARTH 1.0G",
+    physPresetUpper: "UPPER ATM.",
+    physPresetLunar: "LUNAR 0.16G",
+    physPresetMicro: "MICRO-G 0.05",
+    physGravityLabel: "Local Gravity (G)",
+    physAtmLabel: "Atmospheric Density",
+    physDragLabel: "Aero Drag Coeff (Cd)",
+    physThrottleLabel: "Thrust Calibration (%)",
+    physWeightLabel: "Apparent Weight",
+    physThrustReqLabel: "Required Thrust",
+    physThrustAvailLabel: "Calibrated Thrust",
+    physTwrLabel: "TWR Ratio",
+    physDragPeakLabel: "Max-Q Drag",
+    physApogeeLabel: "Est. Apogee",
+    physCalibratedGo: "CALIBRATION NOMINAL · GO",
+    physCalibratedWarn: "HIGH MAX-Q · ADJUST",
+    physNoGoThrust: "INSUFFICIENT THRUST",
+    physTrajCaption: "TRAJECTORY & FORCE VECTORS",
+    checkPhysics: "Physics TWR",
+    physVectorThrust: "THRUST",
+    physVectorWeight: "WEIGHT",
+    physVectorDrag: "DRAG",
+    physStabilityLabel: "NASA STABILITY",
+    physStableIdeal: "IDEAL · NASA SPEC OK",
+    physStableDrift: "DRIFT · FINE TUNE",
+    physStableDanger: "UNSTABLE · OUT OF SPEC",
+    physTargetTag: "NASA TARGET:",
+    physReseedBtn: "RESEED TEST",
+    physNoGoCalib: "CALIBRATE GRAV/ATM",
+    physDeltaVLabel: "Est. Δv",
+    physRefTrajLegend: "DASHED = NASA CORRIDOR",
+    wbImpactTitle: "NASA TACTICAL IMPACT MATRIX",
+    wbViabilityLabel: "MISSION VIABILITY",
+    wbHoverPreviewTag: "LIVE HOVER PREVIEW",
+    wbImpactBudget: "BUDGET CAP",
+    wbImpactMass: "PAYLOAD MASS",
+    wbImpactPower: "POWER GRID",
+    wbImpactScience: "SCIENCE YIELD",
+    wbIspLabel: "Isp:",
+    wbCostOpsLabel: "Ops:",
+    wbGroundSegmentCost: "Ground Network Ops (SCaN)"
+  }
+} as const;
+
+export type TranslationKey = keyof typeof UI_STRINGS.pt;
+
+export function t(key: TranslationKey): string {
+  return UI_STRINGS[currentLang][key] ?? UI_STRINGS.pt[key];
+}
+
+const WAVELENGTH_EN: Record<string, string> = {
+  "Óptico": "Optical",
+  "Infravermelho": "Infrared",
+  "Campo Magnético": "Magnetic Field",
+  "Infravermelho Profundo": "Deep Infrared"
+};
+
+export function translateWavelength(w: string): string {
+  return currentLang === "en" ? WAVELENGTH_EN[w] || w : w;
+}
+
+const VEHICLE_EN: Record<string, { name: string; desc: string }> = {
+  lv_cubesat: {
+    name: "Electron Venture Class (NASA LSP)",
+    desc: "Dedicated small-lift launcher (Isp 311s). Ideal for economical CubeSats in Low Earth Orbit (LEO) up to 300 kg."
+  },
+  lv_medium: {
+    name: "Falcon 9 Block 5 (NASA LSP)",
+    desc: "High-reliability reusable orbital workhorse (Isp 348s, 98% rel.) for Lunar, Mars, and planetary transfer probes."
+  },
+  lv_vulcan: {
+    name: "ULA Vulcan Centaur VC4 (Cryo)",
+    desc: "High-energy Centaur V cryogenic upper stage (Isp 450s) engineered for outer-planet, L1/L2, and heavy science orbits."
+  },
+  lv_heavy: {
+    name: "NASA SLS Block 1B (Artemis EUS)",
+    desc: "Flagship super-heavy rocket (Isp 452s, 105 t LEO) built for JWST-class observatories, Gateway, and Mars architecture."
+  }
+};
+
+export function getLocVehicle<T extends { id: string; name: string; desc: string }>(v: T): T {
+  if (currentLang !== "en") return v;
+  const en = VEHICLE_EN[v.id];
+  return en ? { ...v, ...en } : v;
+}
+
+const BUS_EN: Record<string, { name: string; desc: string }> = {
+  bus_nano: {
+    name: "NASA 6U CubeSat Avionics Bus",
+    desc: "Standardized 6U spacecraft platform (60W solar, LEO radiation tier). Requires lightweight sensors and tight power margins."
+  },
+  bus_orbiter: {
+    name: "MRO / LRO Planetary Orbiter Bus",
+    desc: "Stabilized 3-axis planetary chassis (1,400W solar) with active thermal louvers and mid-tier radiation shielding."
+  },
+  bus_deepspace: {
+    name: "Europa / MMRTG Deep Space Core",
+    desc: "Radiation-hardened interplanetary core (3,800W MMRTG + deep-space arrays) built for Jovian belts, L2, and Mars."
+  }
+};
+
+export function getLocBus<T extends { id: string; name: string; desc: string }>(b: T): T {
+  if (currentLang !== "en") return b;
+  const en = BUS_EN[b.id];
+  return en ? { ...b, ...en } : b;
+}
+
+const INST_EN: Record<string, { name: string; desc: string }> = {
+  inst_rgb: {
+    name: "Multispectral Imager (RainCube)",
+    desc: "Ultra-compact optical weather camera (4 kg, 14 W) for Earth atmosphere monitoring and CubeSat surface imaging."
+  },
+  inst_laser: {
+    name: "LOLA / DSOC Optical Altimeter",
+    desc: "High-precision laser altimeter and optical lasercom terminal (28 kg, 190 W) delivering high-rate planetary science."
+  },
+  inst_ir: {
+    name: "CRISM / M3 Infrared Spectrometer",
+    desc: "Mapping IR spectrometer (26 kg, 150 W) resolving water ice, hydroxyls, and mineral composition through dust."
+  },
+  inst_mass_spec: {
+    name: "SAM / MASPEX Mass Spectrometer",
+    desc: "Gas chromatograph and precision mass analyzer (42 kg, 240 W) detecting biosignatures and isotopes on Mars & Titan."
+  },
+  inst_solar: {
+    name: "MAG / SWEPAM Heliophysics Suite",
+    desc: "Tri-axial fluxgate magnetometer on deployable boom (18 kg, 85 W) tracking solar wind plasma and magnetic reconnection."
+  },
+  inst_radar: {
+    name: "REASON Ice-Penetrating Radar",
+    desc: "Dual-frequency VHF/HF ice-penetrating dipole array (95 kg, 320 W) sounding subsurface oceans on Europa & Titan."
+  },
+  inst_jwst: {
+    name: "NIRCam Cryogenic Telescope (JWST)",
+    desc: "Segmented gold-beryllium cryogenic optics (320 kg, 920 W) observing primordial galaxies and exoplanet spectra at 40 K."
+  }
+};
+
+export function getLocInstrument<T extends { id: string; name: string; wavelength: string; desc: string }>(inst: T): T {
+  if (currentLang !== "en") return inst;
+  const en = INST_EN[inst.id];
+  return {
+    ...inst,
+    name: en?.name || inst.name,
+    desc: en?.desc || inst.desc,
+    wavelength: translateWavelength(inst.wavelength)
+  };
+}
+
+const GROUND_EN: Record<string, { name: string; band: string; desc: string }> = {
+  gs_nen: {
+    name: "Near Space Network (NSN · Wallops)",
+    band: "S-Band / X-Band (150 Mbps)",
+    desc: "Economical $2.0M ground segment for LEO & Lunar proximity tracking. Insufficient link budget beyond lunar orbit."
+  },
+  gs_dsn: {
+    name: "Deep Space Network (DSN · 70m Array)",
+    band: "Ka-Band / Deep Optical ($14M)",
+    desc: "70m parabolic arrays (Goldstone, Madrid, Canberra). Required for L1/L2 Lagrange points and deep-space missions."
+  }
+};
+
+export function getLocGround<T extends { id: string; name: string; band: string; desc: string }>(gs: T): T {
+  if (currentLang !== "en") return gs;
+  const en = GROUND_EN[gs.id];
+  return en ? { ...gs, ...en } : gs;
+}
+
+const MISSION_EN: Record<
+  string,
+  { cml: string; title: string; real_nasa_equivalent: string; briefing: string }
+> = {
+  m1_cml1: {
+    cml: "CML 1 · Mission 01",
+    title: "Eyes on Earth (LEO CubeSat)",
+    real_nasa_equivalent: "CubeSat MarCO / RainCube",
+    briefing: "Build an economical LEO weather CubeSat under $15M and execute NASA's exact ignition switch sequence."
+  },
+  m2_cml2: {
+    cml: "CML 2 · Mission 02",
+    title: "Lunar Mapping (Lunar Orbit)",
+    real_nasa_equivalent: "Lunar Reconnaissance Orbiter (LRO)",
+    briefing: "Send a lunar orbiter with an IR spectrometer and patch the power & telemetry circuit bus under time limit."
+  },
+  m3_cml3: {
+    cml: "CML 3 · Mission 03",
+    title: "Solar Sentinel (Lagrange Point L1)",
+    real_nasa_equivalent: "SOHO Probe / L1 Sentinels",
+    briefing: "Distribute scientific payload weights across cargo bays to zero out center-of-mass torque at L1."
+  },
+  m4_cml4: {
+    cml: "CML 4 · Mission 04",
+    title: "JWST Space Telescope",
+    real_nasa_equivalent: "James Webb Space Telescope (JWST)",
+    briefing: "Calibrate cryogenic LHe pressure and sunshield temperature across rotary manometers before L2 deployment."
+  },
+  m5_mars: {
+    cml: "CML 4 · Mission 05",
+    title: "Sample Return (Mars Sample)",
+    real_nasa_equivalent: "Perseverance / Mars Sample Return",
+    briefing: "Diagnose Mars telemetry faults on the space terminal and run the exact recovery patch command."
+  },
+  m6_europa: {
+    cml: "CML 4 · Mission 06",
+    title: "Icy Oceans (Europa Clipper)",
+    real_nasa_equivalent: "Europa Clipper Probe",
+    briefing: "Solve 4-bit binary logic radiation gates to protect the ice-penetrating radar around Jupiter."
+  },
+  m7_dart: {
+    cml: "CML 4 · Mission 07",
+    title: "Planetary Defense (DART Impact)",
+    real_nasa_equivalent: "DART Mission (Dimorphos)",
+    briefing: "Lock 3 consecutive kinetic interception pulses at the exact green crossover window."
+  },
+  m8_cassini: {
+    cml: "CML 4 · Mission 08",
+    title: "Cassini-Huygens at Titan",
+    real_nasa_equivalent: "Cassini Probe & Huygens Lander",
+    briefing: "Plot safe orbital waypoints on the Saturn ring radar to bypass micrometeoroid debris toward Titan."
+  },
+  m9_parker: {
+    cml: "CML 4 · Mission 09",
+    title: "Parker Solar Probe (Corona)",
+    real_nasa_equivalent: "Parker Solar Probe",
+    briefing: "Modulate the analog magnetic flux shield slider to match unpredictable solar corona waves."
+  },
+  m10_gateway: {
+    cml: "CML 4 · Mission 10",
+    title: "Artemis Lunar Gateway",
+    real_nasa_equivalent: "Artemis Lunar Gateway",
+    briefing: "Synthesize S-Band, Ka-Band, and Optical Laser channels on the harmonic mixer to link Gateway."
+  },
+  m11_juno: {
+    cml: "CML 4 · Mission 11",
+    title: "Juno Probe (Jupiter Core)",
+    real_nasa_equivalent: "Juno Probe · Jupiter",
+    briefing: "Route boolean coolant valves across the node matrix to prevent RTG core overheating."
+  },
+  m12_roman: {
+    cml: "CML 4 · Mission 12",
+    title: "Nancy Grace Roman Telescope",
+    real_nasa_equivalent: "Nancy Grace Roman Telescope",
+    briefing: "Trigger precision orbital periapsis burns on the circular gravity-assist plotter toward L2."
+  },
+  m13_dragonfly: {
+    cml: "CML 4 · Mission 13",
+    title: "Dragonfly Rotorcraft (Titan)",
+    real_nasa_equivalent: "Dragonfly Mission · Titan",
+    briefing: "Rotate 4 hexagonal optical mirrors to 0° alignment to focus Titan organic spectroscopy."
+  },
+  m14_voyager: {
+    cml: "CML 4 · Mission 14",
+    title: "Interstellar Voyager (Heliopause)",
+    real_nasa_equivalent: "Voyager 1 & Golden Record",
+    briefing: "Decode Voyager's faint dot-dash interstellar beacon pulses from beyond the heliopause."
+  },
+  m15_marsbase: {
+    cml: "CML 4 · Mission 15",
+    title: "Mars Orbital Base (Final Command)",
+    real_nasa_equivalent: "Mars Base Camp · NASA Deep Space",
+    briefing: "Ultimate 3-stage command: binary security unlock, millisecond MECO cutoff, and final retro-burn."
+  }
+};
+
+export function getLocMission<
+  T extends { id: string; cml: string; title: string; required_wavelength: string; real_nasa_equivalent: string; briefing: string }
+>(m: T): T {
+  if (currentLang !== "en") return m;
+  const en = MISSION_EN[m.id];
+  return {
+    ...m,
+    cml: en?.cml || m.cml,
+    title: en?.title || m.title,
+    real_nasa_equivalent: en?.real_nasa_equivalent || m.real_nasa_equivalent,
+    briefing: en?.briefing || m.briefing,
+    required_wavelength: translateWavelength(m.required_wavelength)
+  };
+}
+
+const RANK_EN: Record<string, string> = {
+  "Estagiário de Telemetria": "Telemetry Intern",
+  "Engenheiro de Propulsão": "Propulsion Engineer",
+  "Especialista de Carga Útil": "Payload Specialist",
+  "Arquiteto de Sistemas CML": "CML Systems Architect",
+  "Diretor de Voo NASA": "NASA Flight Director",
+  "Comandante Supremo Artemis": "Supreme Artemis Commander"
+};
+
+export function getLocRankTitle(title: string): string {
+  return currentLang === "en" ? RANK_EN[title] || title : title;
+}
+
+const SKIN_EN: Record<string, { name: string; subtitle: string; desc: string; tierLabel: string }> = {
+  chief: {
+    name: "NASA Chief Astronaut",
+    subtitle: "Pressurized Suit & Translucent Visor",
+    desc: "Standard NASA command spacesuit with rounded bubble helmet, translucent deep-blue visor, chest plates, and official patch.",
+    tierLabel: "STANDARD SUIT · FREE"
+  },
+  aces: {
+    name: "ACES Pilot (NASA Orange)",
+    subtitle: "Pressurized Orange Flight Suit",
+    desc: "Official NASA ascent and entry suit in high-visibility orange with dark shoulder pads and translucent blue visor.",
+    tierLabel: "ASCENT CLASS"
+  },
+  tactical: {
+    name: "Retro Tactical Operator",
+    subtitle: "Graphite Armor & Neon Visor",
+    desc: "Heavy industrial graphite rig with amber oxygen tank, armored pauldrons, and green phosphor visor.",
+    tierLabel: "HEAVY ENGINEERING"
+  },
+  eva: {
+    name: "EVA Specialist (Lunar Suit)",
+    subtitle: "White EMU & Gold Visor",
+    desc: "Extravehicular armor for spacewalks with dual PLSS backpack, reinforced shoulders, and gold-plated solar visor.",
+    tierLabel: "DEEP SPACE EDITION"
+  },
+  artemis_xemu: {
+    name: "Artemis xEMU Commander",
+    subtitle: "Lunar Polar Exploration · Cyan & Titanium",
+    desc: "Artemis xEMU surface suit with high-mobility rotary bearings, NASA space-blue stripes, and radiation-shield cyan visor.",
+    tierLabel: "ARTEMIS PROGRAM"
+  },
+  deep_exp: {
+    name: "Experimental Deep Space Suit",
+    subtitle: "Obsidian Armor & RTG Gold",
+    desc: "Supreme command experimental prototype featuring black titanium radiation shielding, gold trim, and integrated telemetry.",
+    tierLabel: "SUPREME PROTOTYPE"
+  }
+};
+
+export function getLocSkin<T extends { id: string; name: string; subtitle: string; desc: string; tierLabel: string }>(
+  sk: T
+): T {
+  if (currentLang !== "en") return sk;
+  const en = SKIN_EN[sk.id];
+  return en ? { ...sk, ...en } : sk;
+}

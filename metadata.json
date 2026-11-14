@@ -1,0 +1,6 @@
+{
+  "name": "Ad Stars",
+  "description": "32-bit retro aerospace engineering simulator and 2.5D mission control hub built for NASA Space Apps Challenge 2026.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

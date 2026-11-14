@@ -1,0 +1,1853 @@
+import * as THREE from "three";
+import {
+  audio,
+  getMission,
+  getVehicle,
+  getBus,
+  getInstruments,
+  missionManager,
+  flightPhysics,
+  computeFlightPhysics
+} from "./data";
+import { getLang } from "./i18n";
+
+let _cachedSoftwareGl: boolean | null = null;
+
+export function detectSoftwareWebGL(): boolean {
+  if (_cachedSoftwareGl !== null) return _cachedSoftwareGl;
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2") || document.createElement("canvas").getContext("webgl");
+    if (!gl) {
+      _cachedSoftwareGl = true;
+      return true;
+    }
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    const gpu = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || "");
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
+    _cachedSoftwareGl = /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    return _cachedSoftwareGl;
+  } catch {
+    _cachedSoftwareGl = true;
+    return true;
+  }
+}
+
+export function disposeObject3D(root: THREE.Object3D | null) {
+  if (!root) return;
+  const texKeys = ["map", "alphaMap", "emissiveMap", "roughnessMap", "metalnessMap", "normalMap", "bumpMap"] as const;
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+    if (mesh.material) {
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat) continue;
+        const mAny = mat as unknown as Record<string, THREE.Texture | undefined>;
+        for (const key of texKeys) {
+          const tex = mAny[key];
+          if (tex && !tex.userData?.sharedTexture) {
+            tex.dispose();
+          }
+        }
+        mat.dispose();
+      }
+    }
+  });
+}
+
+export class TelemetryShaderPipeline {
+  renderer: THREE.WebGLRenderer;
+  wobbleEnabled = true;
+  greenFilterEnabled = false;
+  rt: THREE.WebGLRenderTarget;
+  postScene: THREE.Scene;
+  postCam: THREE.OrthographicCamera;
+  postMat: THREE.ShaderMaterial;
+  quadGeo: THREE.PlaneGeometry;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+    this.renderer.setPixelRatio(1);
+    this.renderer.setSize(320, 240, false);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    this.rt = new THREE.WebGLRenderTarget(320, 240, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+    this.postScene = new THREE.Scene();
+    this.postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const self = this;
+    this.postMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.rt.texture },
+        uRes: { value: new THREE.Vector2(320, 240) },
+        uGreenFilter: { get value() { return self.greenFilterEnabled ? 1.0 : 0.0; } }
+      },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy,0.0,1.0); }`,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec2 uRes;
+        uniform float uGreenFilter;
+        varying vec2 vUv;
+        float bayer(vec2 p){
+          int x = int(mod(p.x, 4.0)); int y = int(mod(p.y, 4.0)); int i = x + y * 4;
+          if(i==0)return 0.0; if(i==1)return 8.0; if(i==2)return 2.0; if(i==3)return 10.0;
+          if(i==4)return 12.0; if(i==5)return 4.0; if(i==6)return 14.0; if(i==7)return 6.0;
+          if(i==8)return 3.0; if(i==9)return 11.0; if(i==10)return 1.0; if(i==11)return 9.0;
+          if(i==12)return 15.0; if(i==13)return 7.0; if(i==14)return 13.0; return 5.0;
+        }
+        void main(){
+          vec2 pix = floor(vUv * uRes);
+          vec4 col = texture2D(tDiffuse, (pix + 0.5) / uRes);
+          float d = ((bayer(pix) / 16.0) - 0.5) / 26.0;
+          vec3 q = clamp(floor((col.rgb + d) * 31.0 + 0.5) / 31.0, 0.0, 1.0);
+          if (uGreenFilter > 0.5) {
+            float luma = pow(clamp(dot(q, vec3(0.299, 0.587, 0.114)), 0.0, 1.0), 0.88);
+            vec3 darkPhos = vec3(0.015, 0.068, 0.032);
+            vec3 midPhos = vec3(0.11, 0.82, 0.36);
+            vec3 hiPhos = vec3(0.52, 1.0, 0.68);
+            vec3 phos = luma < 0.55
+              ? mix(darkPhos, midPhos, luma / 0.55)
+              : mix(midPhos, hiPhos, (luma - 0.55) / 0.45);
+            float scan = 0.88 + 0.12 * mod(pix.y, 2.0);
+            q = clamp(mix(phos, phos * (0.76 + 0.32 * q), 0.24) * scan, 0.0, 1.0);
+          }
+          gl_FragColor = vec4(q, 1.0);
+        }
+      `,
+      depthTest: false, depthWrite: false
+    });
+    this.quadGeo = new THREE.PlaneGeometry(2, 2);
+    this.postScene.add(new THREE.Mesh(this.quadGeo, this.postMat));
+  }
+
+  wobble<T extends THREE.Material & { map?: THREE.Texture | null }>(mat: T): T {
+    const self = this;
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uWobble = { get value() { return self.wobbleEnabled ? 1.0 : 0.0; } };
+
+      shader.vertexShader =
+        "uniform float uWobble;\n" +
+        "#ifdef USE_MAP\n  varying vec2 vAffineUv;\n  varying float vAffineW;\n#endif\n" +
+        shader.vertexShader;
+
+      shader.vertexShader = shader.vertexShader.replace("#include <project_vertex>", `
+        #include <project_vertex>
+        #ifdef USE_MAP
+          vAffineUv = uv * gl_Position.w;
+          vAffineW = gl_Position.w;
+        #endif
+        if (uWobble > 0.5) {
+          vec4 s = gl_Position;
+          float w = max(abs(gl_Position.w), 0.0001);
+          s.xyz = gl_Position.xyz / w;
+          s.x = floor(160.0 * s.x + 0.5) / 160.0;
+          s.y = floor(120.0 * s.y + 0.5) / 120.0;
+          s.xyz *= w;
+          gl_Position = s;
+        }
+      `);
+
+      shader.fragmentShader =
+        "uniform float uWobble;\n" +
+        "#ifdef USE_MAP\n  varying vec2 vAffineUv;\n  varying float vAffineW;\n#endif\n" +
+        shader.fragmentShader;
+
+      shader.fragmentShader = shader.fragmentShader.replace("#include <map_fragment>", `
+        #ifdef USE_MAP
+          float affineW = (vAffineW >= 0.0 ? 1.0 : -1.0) * max(abs(vAffineW), 0.0001);
+          vec2 affineCoord = vAffineUv / affineW;
+          vec2 sampleUv = mix(vMapUv, affineCoord, step(0.5, uWobble) * 0.72);
+          vec4 sampledDiffuseColor = texture2D( map, sampleUv );
+          diffuseColor *= sampledDiffuseColor;
+        #endif
+      `);
+    };
+    mat.customProgramCacheKey = () => (mat.map ? "telemetry-wobble-map" : "telemetry-wobble-nomap");
+    return mat;
+  }
+
+  render(scene: THREE.Scene, cam: THREE.Camera) {
+    this.renderer.setRenderTarget(this.rt);
+    this.renderer.render(scene, cam);
+    this.renderer.setRenderTarget(null);
+    this.renderer.render(this.postScene, this.postCam);
+  }
+
+  dispose() {
+    this.rt?.dispose();
+    this.quadGeo?.dispose();
+    this.postMat?.dispose();
+    this.renderer?.dispose();
+  }
+}
+
+export function createPlanetTex(kind: string, renderer?: THREE.WebGLRenderer) {
+  const c = document.createElement("canvas");
+  c.width = 256; c.height = 128;
+  const g = c.getContext("2d")!;
+
+  if (kind === "earth" || kind === "m1_cml1") {
+    const grad = g.createLinearGradient(0, 0, 0, 128);
+    grad.addColorStop(0, "#1d4ed8");
+    grad.addColorStop(0.5, "#0b3b7a");
+    grad.addColorStop(1, "#1e3a8a");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 256, 128);
+    const land: [number, number, number, number, string][] = [
+      [26, 28, 38, 22, "#2f855a"], [44, 48, 22, 34, "#388e3c"],
+      [110, 24, 48, 24, "#3b7a4a"], [126, 46, 28, 28, "#a16207"],
+      [165, 22, 54, 30, "#2f7a4b"], [192, 66, 24, 18, "#b45309"]
+    ];
+    for (const [lx, ly, lw, lh, col] of land) {
+      g.fillStyle = col;
+      g.fillRect(lx, ly, lw, lh);
+      g.fillStyle = "#4ade8033";
+      g.fillRect(lx + 2, ly + 2, lw - 6, lh - 6);
+    }
+    g.fillStyle = "#e2e8f0";
+    g.fillRect(0, 0, 256, 8);
+    g.fillRect(0, 120, 256, 8);
+    g.fillStyle = "rgba(255, 255, 255, 0.42)";
+    for (let i = 0; i < 38; i++) {
+      g.fillRect((i * 29) % 240, 10 + ((i * 19) % 104), 18 + (i % 14), 3);
+    }
+  } else if (kind === "m2_cml2" || kind === "m10_gateway") {
+    g.fillStyle = "#8a9099"; g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "#5c626d";
+    g.fillRect(32, 24, 46, 36);
+    g.fillRect(118, 18, 58, 42);
+    g.fillRect(178, 56, 40, 32);
+    for (let i = 0; i < 65; i++) {
+      const cx = (i * 43 + 12) % 246;
+      const cy = 10 + ((i * 29) % 108);
+      const cr = 2 + (i % 6);
+      g.fillStyle = "#cbd5e1";
+      g.beginPath(); g.arc(cx, cy, cr + 1.2, 0, Math.PI * 2); g.fill();
+      g.fillStyle = "#474d57";
+      g.beginPath(); g.arc(cx + 0.5, cy + 0.5, cr, 0, Math.PI * 2); g.fill();
+    }
+  } else if (kind === "jupiter" || kind === "m11_juno") {
+    const bands = ["#d9b38c", "#b86b3a", "#e6d2b5", "#a34a24", "#d69e6e", "#f0dfc8", "#9c522b", "#c99668"];
+    for (let y = 0; y < 128; y += 8) {
+      g.fillStyle = bands[(y / 8) % bands.length];
+      g.fillRect(0, y, 256, 9);
+    }
+    for (let i = 0; i < 40; i++) {
+      g.fillStyle = i % 2 === 0 ? "rgba(255,245,230,0.28)" : "rgba(120,45,15,0.28)";
+      g.fillRect((i * 31) % 240, (i * 17) % 122, 22, 3);
+    }
+    g.fillStyle = "#b91c1c";
+    g.beginPath(); g.ellipse(158, 78, 18, 10, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = "#ef4444";
+    g.beginPath(); g.ellipse(158, 78, 11, 6, 0, 0, Math.PI * 2); g.fill();
+  } else if (kind === "m5_mars" || kind === "m15_marsbase") {
+    g.fillStyle = "#a83814"; g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "#c95322";
+    for (let i = 0; i < 32; i++) g.fillRect((i * 33) % 236, 10 + ((i * 23) % 102), 20, 10);
+    g.fillStyle = "#5c1f0c";
+    g.fillRect(68, 56, 76, 6);
+    for (let i = 0; i < 16; i++) g.fillRect((i * 41) % 230, 18 + ((i * 19) % 86), 14, 7);
+    g.fillStyle = "#f8fafc";
+    g.fillRect(0, 0, 256, 9);
+    g.fillRect(0, 121, 256, 7);
+  } else if (kind === "m6_europa") {
+    g.fillStyle = "#cbd5e1"; g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "#e0f2fe";
+    for (let i = 0; i < 24; i++) g.fillRect((i * 27) % 240, (i * 19) % 118, 24, 9);
+    g.strokeStyle = "#9a3412";
+    g.lineWidth = 1.5;
+    for (let i = 0; i < 22; i++) {
+      g.beginPath();
+      g.moveTo((i * 23) % 256, 0);
+      g.lineTo((i * 47 + 50) % 256, 128);
+      g.stroke();
+    }
+  } else if (kind === "m7_dart") {
+    g.fillStyle = "#44403c"; g.fillRect(0, 0, 256, 128);
+    for (let i = 0; i < 55; i++) {
+      g.fillStyle = i % 2 === 0 ? "#292524" : "#78716c";
+      g.fillRect((i * 31) % 244, (i * 17) % 118, 6 + (i % 7), 4 + (i % 6));
+    }
+    g.fillStyle = "#f59e0b";
+    g.fillRect(112, 58, 12, 9);
+  } else if (kind === "m8_cassini" || kind === "m13_dragonfly") {
+    const tGrad = g.createLinearGradient(0, 0, 0, 128);
+    tGrad.addColorStop(0, "#d97706");
+    tGrad.addColorStop(0.5, "#b45309");
+    tGrad.addColorStop(1, "#92400e");
+    g.fillStyle = tGrad;
+    g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "#082f49";
+    g.fillRect(28, 22, 42, 20);
+    g.fillRect(142, 34, 54, 18);
+    g.fillStyle = "rgba(253, 224, 71, 0.25)";
+    for (let i = 0; i < 28; i++) g.fillRect((i * 27) % 240, 12 + ((i * 13) % 104), 26, 4);
+  } else if (kind === "m12_roman" || kind === "m14_voyager") {
+    g.fillStyle = "#09081a"; g.fillRect(0, 0, 256, 128);
+    const neb = g.createRadialGradient(128, 64, 6, 128, 64, 96);
+    neb.addColorStop(0, kind === "m12_roman" ? "rgba(192, 132, 252, 0.65)" : "rgba(56, 189, 248, 0.6)");
+    neb.addColorStop(1, "rgba(9, 8, 26, 0)");
+    g.fillStyle = neb;
+    g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "#e0f2fe";
+    for (let i = 0; i < 48; i++) g.fillRect((i * 37) % 250, (i * 23) % 124, 2, 2);
+  } else {
+    const sGrad = g.createRadialGradient(128, 64, 6, 128, 64, 110);
+    sGrad.addColorStop(0, "#fef9c3");
+    sGrad.addColorStop(0.4, "#f59e0b");
+    sGrad.addColorStop(1, "#9a3412");
+    g.fillStyle = sGrad;
+    g.fillRect(0, 0, 256, 128);
+    g.fillStyle = "rgba(255, 255, 255, 0.25)";
+    for (let i = 0; i < 24; i++) g.fillRect((i * 29) % 240, (i * 17) % 120, 12, 3);
+  }
+
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.magFilter = THREE.NearestFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  if (renderer) t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+export function createPadDeckTex(renderer?: THREE.WebGLRenderer) {
+  const c = document.createElement("canvas");
+  c.width = 256; c.height = 256;
+  const g = c.getContext("2d")!;
+  g.fillStyle = "#334155";
+  g.fillRect(0, 0, 256, 256);
+  g.strokeStyle = "#1e293b";
+  g.lineWidth = 2;
+  for (let i = 0; i <= 256; i += 32) {
+    g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 256); g.stroke();
+    g.beginPath(); g.moveTo(0, i); g.lineTo(256, i); g.stroke();
+  }
+  const blast = g.createRadialGradient(128, 128, 8, 128, 128, 72);
+  blast.addColorStop(0, "rgba(10, 12, 16, 0.85)");
+  blast.addColorStop(0.5, "rgba(20, 24, 32, 0.45)");
+  blast.addColorStop(1, "rgba(20, 24, 32, 0)");
+  g.fillStyle = blast;
+  g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 256; i += 16) {
+    g.fillStyle = (i / 16) % 2 === 0 ? "#eab308" : "#090d14";
+    g.fillRect(i, 4, 16, 8);
+    g.fillRect(i, 244, 16, 8);
+    g.fillRect(4, i, 8, 16);
+    g.fillRect(244, i, 8, 16);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  if (renderer) tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return tex;
+}
+
+export function buildSpacecraft3D(busId: string, instIds: string[], pipe: TelemetryShaderPipeline) {
+  const g = new THREE.Group();
+  const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => pipe.wobble(m);
+  const gold = w(new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.3, metalness: 0.85, flatShading: true }));
+  const silver = w(new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.35, metalness: 0.78, flatShading: true }));
+  const dark = w(new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.65, metalness: 0.3, flatShading: true }));
+  const solar = w(new THREE.MeshStandardMaterial({ color: 0x1d4ed8, roughness: 0.25, metalness: 0.5, flatShading: true }));
+  const white = w(new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.42, metalness: 0.22, flatShading: true }));
+
+  if (busId === "bus_nano") {
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.9, 0.45), gold));
+    const wL = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.03, 0.36), solar);
+    wL.position.set(-0.7, 0.1, 0);
+    const wR = wL.clone(); wR.position.x = 0.7;
+    const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.45, 5), silver);
+    ant.position.y = 0.65;
+    g.add(wL, wR, ant);
+  } else if (busId === "bus_orbiter") {
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 0.85, 8), gold));
+    const dish = new THREE.Mesh(new THREE.ConeGeometry(0.55, 0.25, 10, 1, true), silver);
+    dish.rotation.x = Math.PI; dish.position.y = 0.65;
+    const wL = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.04, 0.52), solar);
+    wL.position.set(-1.3, 0, 0);
+    const wR = wL.clone(); wR.position.x = 1.3;
+    g.add(dish, wL, wR);
+  } else if (busId === "bus_orion") {
+    const capsule = new THREE.Mesh(new THREE.ConeGeometry(0.66, 0.78, 12), silver);
+    capsule.position.y = 0.52;
+    const heatshield = new THREE.Mesh(new THREE.CylinderGeometry(0.68, 0.62, 0.14, 12), dark);
+    heatshield.position.y = 0.12;
+    const esm = new THREE.Mesh(new THREE.CylinderGeometry(0.58, 0.58, 0.78, 12), white);
+    esm.position.y = -0.34;
+    const bell = new THREE.Mesh(new THREE.ConeGeometry(0.24, 0.36, 10), dark);
+    bell.rotation.x = Math.PI; bell.position.y = -0.88;
+    g.add(capsule, heatshield, esm, bell);
+    for (let k = 0; k < 4; k++) {
+      const ang = (k / 4) * Math.PI * 2 + Math.PI / 4;
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.04, 0.34), solar);
+      wing.position.set(Math.cos(ang) * 1.1, -0.35, Math.sin(ang) * 1.1);
+      wing.rotation.y = -ang;
+      wing.rotation.z = 0.18;
+      g.add(wing);
+    }
+  } else if (busId === "bus_hls") {
+    const ascentCab = new THREE.Mesh(new THREE.CylinderGeometry(0.58, 0.66, 0.92, 8), white);
+    ascentCab.position.y = 0.45;
+    const descentStage = new THREE.Mesh(new THREE.CylinderGeometry(0.84, 0.92, 0.62, 8), gold);
+    descentStage.position.y = -0.34;
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.68, 0.68, 0.14, 8), dark);
+    collar.position.y = 0.02;
+    const dome = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.44, 0.24, 8), silver);
+    dome.position.y = 1.02;
+    g.add(ascentCab, descentStage, collar, dome);
+    for (let k = 0; k < 4; k++) {
+      const ang = (k / 4) * Math.PI * 2 + Math.PI / 4;
+      const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.88, 6), silver);
+      strut.position.set(Math.cos(ang) * 0.96, -0.78, Math.sin(ang) * 0.96);
+      strut.rotation.z = Math.cos(ang) * 0.32;
+      strut.rotation.x = -Math.sin(ang) * 0.32;
+      const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 0.06, 8), gold);
+      foot.position.set(Math.cos(ang) * 1.12, -1.18, Math.sin(ang) * 1.12);
+      g.add(strut, foot);
+    }
+  } else {
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.78, 0.88, 1.05, 6), silver));
+    const shield = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.1, 0.08, 6), gold);
+    shield.position.y = -0.42;
+    const rtg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.9, 6), dark);
+    rtg.rotation.z = Math.PI / 2; rtg.position.set(1.1, -0.1, 0);
+    const hga = new THREE.Mesh(new THREE.ConeGeometry(0.8, 0.3, 12, 1, true), silver);
+    hga.rotation.x = Math.PI; hga.position.y = 0.8;
+    g.add(shield, rtg, hga);
+  }
+
+  if (instIds.includes("inst_rgb")) {
+    const cam = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, 0.32, 8), dark);
+    cam.rotation.x = Math.PI / 2; cam.position.set(0, 0.12, 0.52);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.05, 8), w(new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.1, metalness: 0.9 })));
+    lens.rotation.x = Math.PI / 2; lens.position.set(0, 0.12, 0.7);
+    g.add(cam, lens);
+  }
+  if (instIds.includes("inst_laser")) {
+    const turret = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.28, 8), silver);
+    turret.rotation.x = Math.PI / 2; turret.position.set(0.45, 0.22, 0.48);
+    const emitter = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.12, 8), w(new THREE.MeshStandardMaterial({ color: 0x34d399, roughness: 0.1, metalness: 0.85 })));
+    emitter.rotation.x = Math.PI / 2; emitter.position.set(0.45, 0.22, 0.66);
+    g.add(turret, emitter);
+  }
+  if (instIds.includes("inst_ir")) {
+    const box = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.32, 0.42), silver);
+    box.position.set(-0.46, 0.3, 0.35);
+    g.add(box);
+  }
+  if (instIds.includes("inst_mass_spec")) {
+    const chamber = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.46, 8), gold);
+    chamber.position.set(-0.42, -0.18, 0.45);
+    const inlet = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.22, 8), dark);
+    inlet.rotation.x = Math.PI / 2; inlet.position.set(-0.42, -0.18, 0.72);
+    g.add(chamber, inlet);
+  }
+  if (instIds.includes("inst_solar")) {
+    const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.25, 5), silver);
+    boom.rotation.z = Math.PI / 2; boom.position.set(0.95, 0.35, 0);
+    const mag = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 0), gold);
+    mag.position.set(1.58, 0.35, 0);
+    g.add(boom, mag);
+  }
+  if (instIds.includes("inst_radar")) {
+    const radarPanel = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.08, 0.55), w(new THREE.MeshStandardMaterial({ color: 0x22d3ee, roughness: 0.3, metalness: 0.6, flatShading: true })));
+    radarPanel.position.set(0, -0.56, 0);
+    const dipole = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 2.3, 5), silver);
+    dipole.rotation.x = Math.PI / 2;
+    dipole.position.set(0, -0.58, 0);
+    g.add(radarPanel, dipole);
+  }
+  if (instIds.includes("inst_jwst")) {
+    const sunshield = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.05, 2.1), silver);
+    sunshield.position.set(0, 0.7, 0);
+    const mirror = new THREE.Group();
+    mirror.position.set(0, 1.32, 0);
+    const hex = new THREE.CylinderGeometry(0.21, 0.21, 0.07, 6);
+    [[0, 0], [0.38, 0], [-0.38, 0], [0.19, 0.33], [-0.19, 0.33], [0.19, -0.33], [-0.19, -0.33]].forEach(([ox, oy]) => {
+      const seg = new THREE.Mesh(hex, gold);
+      seg.rotation.x = Math.PI / 2; seg.position.set(ox, oy, 0);
+      mirror.add(seg);
+    });
+    g.add(sunshield, mirror);
+  }
+  return g;
+}
+
+export function buildRocket3D(vehicleId: string, pipe: TelemetryShaderPipeline, missionId = "m1_cml1") {
+  const rocket = new THREE.Group();
+  const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => pipe.wobble(m);
+  const white = w(new THREE.MeshStandardMaterial({ color: 0xf1f5f9, roughness: 0.45, metalness: 0.2, flatShading: true }));
+  const black = w(new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.55, metalness: 0.4, flatShading: true }));
+  const orange = w(new THREE.MeshStandardMaterial({ color: 0xea580c, roughness: 0.7, metalness: 0.1, flatShading: true }));
+  const metal = w(new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.35, metalness: 0.8, flatShading: true }));
+  const gold = w(new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.28, metalness: 0.85, flatShading: true }));
+  const cyan = w(new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.25, metalness: 0.65, flatShading: true }));
+
+  const core = new THREE.Group(), upper = new THREE.Group();
+  let fairingBaseY = 4.2;
+  let coreRad = 0.5;
+
+  if (vehicleId === "lv_cubesat") {
+    coreRad = 0.32;
+    fairingBaseY = 4.2;
+    const s1 = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 3.2, 8), black); s1.position.y = 1.6;
+    const stripe = new THREE.Mesh(new THREE.CylinderGeometry(0.33, 0.33, 0.22, 8), cyan); stripe.position.y = 2.85;
+    const noz = new THREE.Mesh(new THREE.ConeGeometry(0.26, 0.4, 7), metal); noz.position.y = 0.05;
+    core.add(s1, stripe, noz);
+    const s2 = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 1.0, 8), black); s2.position.y = 3.7;
+    const fair = new THREE.Mesh(new THREE.ConeGeometry(0.38, 1.3, 8), white); fair.position.y = 4.85;
+    upper.add(s2, fair);
+  } else if (vehicleId === "lv_medium") {
+    coreRad = 0.5;
+    fairingBaseY = 5.4;
+    const s1 = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 4.0, 10), white); s1.position.y = 2.0;
+    const inter = new THREE.Mesh(new THREE.CylinderGeometry(0.51, 0.51, 0.7, 10), black); inter.position.y = 3.85;
+    const legCol = black;
+    for (let k = 0; k < 4; k++) {
+      const ang = (k / 4) * Math.PI * 2;
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.9, 0.06), legCol);
+      leg.position.set(Math.cos(ang) * 0.52, 0.5, Math.sin(ang) * 0.52);
+      leg.rotation.y = -ang;
+      core.add(leg);
+    }
+    const eng = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.54, 0.55, 8), metal); eng.position.y = -0.1;
+    core.add(s1, inter, eng);
+    const s2 = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 1.2, 10), white); s2.position.y = 4.8;
+    const fair = new THREE.Mesh(new THREE.ConeGeometry(0.62, 1.65, 10), white); fair.position.y = 6.2;
+    upper.add(s2, fair);
+  } else if (vehicleId === "lv_vulcan") {
+    coreRad = 0.56;
+    fairingBaseY = 5.65;
+    const coreStage = new THREE.Mesh(new THREE.CylinderGeometry(0.54, 0.56, 4.2, 10), white); coreStage.position.y = 2.1;
+    const vulcanStripe = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 0.45, 10), black); vulcanStripe.position.y = 3.9;
+    const gemL = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 3.2, 8), black); gemL.position.set(-0.78, 1.6, 0);
+    const gemConeL = new THREE.Mesh(new THREE.ConeGeometry(0.2, 0.55, 8), white); gemConeL.position.set(-0.78, 3.45, 0);
+    const gemR = gemL.clone(); gemR.position.x = 0.78;
+    const gemConeR = gemConeL.clone(); gemConeR.position.x = 0.78;
+    const eng = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.56, 0.55, 8), metal); eng.position.y = -0.12;
+    core.add(coreStage, vulcanStripe, gemL, gemConeL, gemR, gemConeR, eng);
+    const centaur = new THREE.Mesh(new THREE.CylinderGeometry(0.54, 0.54, 1.35, 10), metal); centaur.position.y = 4.95;
+    const fair = new THREE.Mesh(new THREE.ConeGeometry(0.68, 1.9, 10), white); fair.position.y = 6.55;
+    upper.add(centaur, fair);
+  } else {
+    coreRad = 0.68;
+    fairingBaseY = 5.85;
+    const tank = new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.65, 4.6, 10), orange); tank.position.y = 2.3;
+    const srbL = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 4.1, 8), white); srbL.position.set(-0.98, 2.05, 0);
+    const coneL = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.75, 8), white); coneL.position.set(-0.98, 4.45, 0);
+    const srbR = srbL.clone(); srbR.position.x = 0.98;
+    const coneR = coneL.clone(); coneR.position.x = 0.98;
+    const eng = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.68, 0.6, 8), metal); eng.position.y = -0.15;
+    core.add(tank, srbL, coneL, srbR, coneR, eng);
+    const icps = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.65, 1.25, 10), white); icps.position.y = 5.2;
+    const fair = new THREE.Mesh(new THREE.ConeGeometry(0.75, 1.85, 10), white); fair.position.y = 6.75;
+    upper.add(icps, fair);
+  }
+
+  // Dynamic Mission/Stage Hardware Adaptations
+  const isLunar = missionId === "m2_cml2" || missionId === "m10_gateway";
+  const isObservatory = missionId === "m4_cml4" || missionId === "m12_roman";
+  const isMars = missionId === "m5_mars" || missionId === "m15_marsbase";
+  const isOuter = ["m6_europa", "m8_cassini", "m11_juno", "m13_dragonfly", "m14_voyager"].includes(missionId);
+  const isInnerSun = ["m3_cml3", "m7_dart", "m9_parker"].includes(missionId);
+
+  if (isLunar) {
+    const tliCollar = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.12, coreRad * 1.05, 0.35, 8), metal);
+    tliCollar.position.y = fairingBaseY - 0.15;
+    const dockRing = new THREE.Mesh(new THREE.TorusGeometry(coreRad * 0.75, 0.055, 6, 12), gold);
+    dockRing.rotation.x = Math.PI / 2;
+    dockRing.position.y = fairingBaseY + 0.55;
+    upper.add(tliCollar, dockRing);
+  } else if (isObservatory) {
+    const hammerhead = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.32, coreRad * 1.15, 0.85, 8), white);
+    hammerhead.position.y = fairingBaseY + 0.35;
+    const rib = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.35, coreRad * 1.35, 0.14, 8), gold);
+    rib.position.y = fairingBaseY + 0.35;
+    upper.add(hammerhead, rib);
+  } else if (isMars) {
+    const aeroShield = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.24, coreRad * 1.04, 0.45, 10), orange);
+    aeroShield.position.y = fairingBaseY + 0.1;
+    const retroBand = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.06, coreRad * 1.06, 0.2, 10), black);
+    retroBand.position.y = fairingBaseY - 0.45;
+    upper.add(aeroShield, retroBand);
+  } else if (isOuter) {
+    for (let k = 0; k < 4; k++) {
+      const ang = (k / 4) * Math.PI * 2 + Math.PI / 4;
+      const fin = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.55, 0.06), gold);
+      fin.position.set(Math.cos(ang) * (coreRad + 0.12), fairingBaseY - 0.25, Math.sin(ang) * (coreRad + 0.12));
+      fin.rotation.y = -ang;
+      upper.add(fin);
+    }
+    const rtgCap = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 0.38, coreRad * 0.55, 0.45, 8), metal);
+    rtgCap.position.y = fairingBaseY + 1.4;
+    upper.add(rtgCap);
+  } else if (isInnerSun) {
+    const thermalRing = new THREE.Mesh(new THREE.CylinderGeometry(coreRad * 1.14, coreRad * 1.14, 0.28, 8), gold);
+    thermalRing.position.y = fairingBaseY - 0.1;
+    const spear = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.06, 0.65, 6), cyan);
+    spear.position.y = fairingBaseY + 1.85;
+    upper.add(thermalRing, spear);
+  }
+
+  rocket.add(core, upper);
+  return { rocket, core, upper };
+}
+
+export interface LaunchHooks {
+  appendFlightLog: (msg: string) => void;
+  startMissionMinigame: () => void;
+  updateMissionMinigame: (dt: number) => void;
+  finishMissionMinigameAndEvaluate: () => void;
+  updateLaunchControlsUI: () => void;
+}
+
+export class TelemetryLaunchRenderer {
+  isSoftwareGl: boolean;
+  pipe: TelemetryShaderPipeline;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  _skyAtmosphere: THREE.Color;
+  _skySpace: THREE.Color;
+  _skyCur: THREE.Color;
+  starsMat: THREE.ShaderMaterial;
+  stars: THREE.Points;
+  padGroup: THREE.Group;
+  towerBeacon: THREE.Mesh;
+  umbilicalArms: THREE.Group[] = [];
+  plume: THREE.Group;
+  flameOuter: THREE.Mesh;
+  flameInner: THREE.Mesh;
+  padParticles: { mesh: THREE.Mesh; isSpark: boolean; life: number; vx: number; vy: number; vz: number }[] = [];
+  earthGroup: THREE.Group;
+  earthMesh: THREE.Mesh;
+  earthAtmo: THREE.Mesh;
+  planetGroup: THREE.Group;
+  planet: THREE.Mesh;
+  planetHalo: THREE.Mesh;
+  jupiterBackdrop: THREE.Mesh;
+  trajectoryLine: THREE.Line;
+  rocketRig: { rocket: THREE.Group; core: THREE.Group; upper: THREE.Group } | null = null;
+  craftMesh: THREE.Group | null = null;
+  configSignature = "";
+  cameraMode = 0;
+  active = false;
+  frameId = 0;
+  lastFrameTime = 0;
+  FIXED_DT = 1 / 60;
+  accumulator = 0;
+  elapsed = 0;
+  _isEuropa = false;
+  _isEarthMission = false;
+  ascentPhysicsSnapshot: ReturnType<typeof computeFlightPhysics> | null = null;
+  flight = { phase: "PAD", t: 0, countdown: 3.0, alt: 0, vel: 0, g: 1.0, fuel: 100, rocketY: 0, sepDone: false, bonusPct: 0 };
+  hooks: LaunchHooks;
+
+  constructor(canvas: HTMLCanvasElement, hooks: LaunchHooks) {
+    this.hooks = hooks;
+    this.isSoftwareGl = detectSoftwareWebGL();
+    this.pipe = new TelemetryShaderPipeline(canvas);
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x1b3a66);
+    this.scene.fog = new THREE.FogExp2(0x1b3a66, 0.011);
+
+    this._skyAtmosphere = new THREE.Color(0x1b3a66);
+    this._skySpace = new THREE.Color(0x02050c);
+    this._skyCur = new THREE.Color(0x1b3a66);
+
+    this.camera = new THREE.PerspectiveCamera(52, 320 / 240, 0.1, 350);
+    this.scene.add(new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 0.9));
+    const key = new THREE.DirectionalLight(0xfff1d6, 1.7); key.position.set(10, 18, 12);
+    const rim = new THREE.DirectionalLight(0x38bdf8, 0.8); rim.position.set(-12, 8, -10);
+    this.scene.add(key, rim);
+
+    const starCount = 650;
+    const sGeo = new THREE.BufferGeometry();
+    const sPos = new Float32Array(starCount * 3);
+    const sCol = new Float32Array(starCount * 3);
+    const sSize = new Float32Array(starCount);
+    const sPhase = new Float32Array(starCount);
+    const starPalette = [
+      [1.0, 1.0, 1.0],
+      [0.72, 0.9, 1.0],
+      [1.0, 0.9, 0.65],
+      [0.85, 0.95, 1.0]
+    ];
+    for (let i = 0; i < starCount; i++) {
+      const r = 75 + Math.random() * 90;
+      const th = Math.random() * Math.PI * 2;
+      const ph = Math.acos(2 * Math.random() - 1);
+      sPos[i * 3] = r * Math.sin(ph) * Math.cos(th);
+      sPos[i * 3 + 1] = r * Math.cos(ph);
+      sPos[i * 3 + 2] = r * Math.sin(ph) * Math.sin(th);
+      const c = starPalette[i % starPalette.length];
+      sCol[i * 3] = c[0]; sCol[i * 3 + 1] = c[1]; sCol[i * 3 + 2] = c[2];
+      sSize[i] = 1.4 + Math.random() * 2.6;
+      sPhase[i] = Math.random() * Math.PI * 2;
+    }
+    sGeo.setAttribute("position", new THREE.BufferAttribute(sPos, 3));
+    sGeo.setAttribute("aColor", new THREE.BufferAttribute(sCol, 3));
+    sGeo.setAttribute("aSize", new THREE.BufferAttribute(sSize, 1));
+    sGeo.setAttribute("aPhase", new THREE.BufferAttribute(sPhase, 1));
+    this.starsMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 }, uOpacity: { value: 0 } },
+      vertexShader: `
+        attribute float aSize;
+        attribute float aPhase;
+        attribute vec3 aColor;
+        uniform float uTime;
+        varying vec3 vColor;
+        varying float vTwinkle;
+        void main() {
+          vColor = aColor;
+          vTwinkle = 0.55 + 0.45 * sin(uTime * 2.4 + aPhase);
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = aSize * (70.0 / max(10.0, -mv.z));
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        uniform float uOpacity;
+        varying vec3 vColor;
+        varying float vTwinkle;
+        void main() {
+          vec2 d = gl_PointCoord - vec2(0.5);
+          if (dot(d, d) > 0.25) discard;
+          gl_FragColor = vec4(vColor, uOpacity * vTwinkle);
+        }
+      `,
+      transparent: true,
+      depthWrite: false
+    });
+    this.stars = new THREE.Points(sGeo, this.starsMat);
+    this.scene.add(this.stars);
+
+    this.padGroup = new THREE.Group();
+    const padMat = this.pipe.wobble(new THREE.MeshStandardMaterial({ map: createPadDeckTex(this.pipe.renderer), roughness: 0.88, flatShading: true }));
+    const darkMetal = this.pipe.wobble(new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.65, metalness: 0.55, flatShading: true }));
+    const towerMat = this.pipe.wobble(new THREE.MeshStandardMaterial({ color: 0xb91c1c, roughness: 0.55, metalness: 0.45, flatShading: true }));
+    const cryoMat = this.pipe.wobble(new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.4, metalness: 0.25, flatShading: true }));
+
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(10.5, 0.7, 10.5), padMat);
+    deck.position.y = -0.35;
+    const trench = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.16, 4.4), darkMetal);
+    trench.position.set(0, 0.02, 0.4);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(110, 110), this.pipe.wobble(new THREE.MeshStandardMaterial({ color: 0x172030, roughness: 1 })));
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.7;
+
+    for (const [cx, cz] of [[-1.1, -1.1], [1.1, -1.1], [-1.1, 1.1], [1.1, 1.1]]) {
+      const clamp = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.75, 0.42), darkMetal);
+      clamp.position.set(cx, 0.35, cz);
+      this.padGroup.add(clamp);
+    }
+
+    const towerGroup = new THREE.Group();
+    towerGroup.position.set(-2.5, 0, 0);
+    for (const [lx, lz] of [[-0.45, -0.45], [0.45, -0.45], [-0.45, 0.45], [0.45, 0.45]]) {
+      const col = new THREE.Mesh(new THREE.BoxGeometry(0.18, 7.6, 0.18), towerMat);
+      col.position.set(lx, 3.8, lz);
+      towerGroup.add(col);
+    }
+    for (let ty = 1.2; ty <= 7.2; ty += 1.5) {
+      const collar = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.16, 1.1), darkMetal);
+      collar.position.y = ty;
+      towerGroup.add(collar);
+    }
+    const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.08, 1.6, 5), darkMetal);
+    mast.position.y = 8.4;
+    this.towerBeacon = new THREE.Mesh(new THREE.SphereGeometry(0.14, 6, 6), new THREE.MeshBasicMaterial({ color: 0xef4444 }));
+    this.towerBeacon.position.y = 9.25;
+    towerGroup.add(mast, this.towerBeacon);
+
+    for (const armY of [2.1, 3.8, 5.2]) {
+      const pivot = new THREE.Group();
+      pivot.position.set(-2.05, armY, 0);
+      const armBeam = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.2, 0.24), towerMat);
+      armBeam.position.set(0.85, 0, 0);
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.32, 0.36), darkMetal);
+      head.position.set(1.68, 0, 0);
+      pivot.add(armBeam, head);
+      this.padGroup.add(pivot);
+      this.umbilicalArms.push(pivot);
+    }
+
+    const tank1 = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 4.2, 10), cryoMat);
+    tank1.position.set(-7.5, 1.4, -7.2);
+    const cap1 = new THREE.Mesh(new THREE.SphereGeometry(0.9, 10, 6), cryoMat);
+    cap1.position.set(-7.5, 3.5, -7.2);
+    const tank2 = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 3.5, 10), cryoMat);
+    tank2.position.set(-5.3, 1.05, -7.8);
+    const cap2 = new THREE.Mesh(new THREE.SphereGeometry(0.8, 10, 6), cryoMat);
+    cap2.position.set(-5.3, 2.8, -7.8);
+    const sphereTank = new THREE.Mesh(new THREE.SphereGeometry(1.45, 12, 10), cryoMat);
+    sphereTank.position.set(6.8, 1.2, -7.5);
+    const sphereBase = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.25, 0.9, 8), darkMetal);
+    sphereBase.position.set(6.8, -0.1, -7.5);
+    const pipeRun = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 8.2, 6), darkMetal);
+    pipeRun.rotation.z = Math.PI / 2;
+    pipeRun.rotation.y = 0.65;
+    pipeRun.position.set(-3.8, 0.15, -3.9);
+
+    for (const [fx, fz] of [[5.6, 5.2], [-5.8, 5.0]]) {
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 4.2, 6), darkMetal);
+      pole.position.set(fx, 1.4, fz);
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.25, 0.25), new THREE.MeshBasicMaterial({ color: 0xfef3c7 }));
+      head.position.set(fx, 3.5, fz);
+      this.padGroup.add(pole, head);
+    }
+
+    this.padGroup.add(deck, trench, ground, towerGroup, tank1, cap1, tank2, cap2, sphereTank, sphereBase, pipeRun);
+    this.scene.add(this.padGroup);
+
+    this.plume = new THREE.Group();
+    this.flameOuter = new THREE.Mesh(new THREE.ConeGeometry(0.58, 3.1, 8), new THREE.MeshBasicMaterial({ color: 0xf97316 }));
+    this.flameOuter.rotation.x = Math.PI;
+    this.flameInner = new THREE.Mesh(new THREE.ConeGeometry(0.3, 2.0, 7), new THREE.MeshBasicMaterial({ color: 0xfef08a }));
+    this.flameInner.rotation.x = Math.PI;
+    this.plume.add(this.flameOuter, this.flameInner);
+    this.plume.visible = false;
+    this.scene.add(this.plume);
+
+    const smokeGeo = new THREE.SphereGeometry(0.38, 7, 6);
+    const sparkGeo = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+    for (let i = 0; i < 42; i++) {
+      const isSpark = i >= 28;
+      const mat = new THREE.MeshBasicMaterial({
+        color: isSpark ? 0xfbbf24 : 0xe2e8f0,
+        transparent: true,
+        opacity: isSpark ? 0.95 : 0.36,
+        depthWrite: false
+      });
+      const mesh = new THREE.Mesh(isSpark ? sparkGeo : smokeGeo, mat);
+      this.scene.add(mesh);
+      const angle = Math.random() * Math.PI * 2;
+      const spd = isSpark ? (1.2 + Math.random() * 2.2) : (0.65 + Math.random() * 1.4);
+      this.padParticles.push({
+        mesh,
+        isSpark,
+        life: Math.random(),
+        vx: Math.cos(angle) * spd,
+        vy: isSpark ? (1.0 + Math.random() * 2.2) : (0.35 + Math.random() * 0.7),
+        vz: Math.sin(angle) * spd
+      });
+    }
+
+    this.earthGroup = new THREE.Group();
+    this.earthMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(22, 28, 20),
+      this.pipe.wobble(new THREE.MeshStandardMaterial({ map: createPlanetTex("earth", this.pipe.renderer), roughness: 0.78, metalness: 0.08 }))
+    );
+    this.earthAtmo = new THREE.Mesh(
+      new THREE.SphereGeometry(23.1, 28, 20),
+      new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.24, side: THREE.BackSide, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    this.earthGroup.add(this.earthMesh, this.earthAtmo);
+    this.earthGroup.position.set(0, -25.5, -14);
+    this.earthGroup.visible = false;
+    this.scene.add(this.earthGroup);
+
+    this.planetGroup = new THREE.Group();
+    this.planet = new THREE.Mesh(
+      new THREE.SphereGeometry(12, 24, 18),
+      this.pipe.wobble(new THREE.MeshStandardMaterial({ roughness: 0.85, flatShading: false }))
+    );
+    this.planetHalo = new THREE.Mesh(
+      new THREE.SphereGeometry(12.65, 24, 18),
+      new THREE.MeshBasicMaterial({ color: 0x60a5fa, transparent: true, opacity: 0.16, side: THREE.BackSide, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    this.planetGroup.add(this.planet, this.planetHalo);
+    this.planetGroup.position.set(0, -14.8, -10);
+    this.planetGroup.visible = false;
+    this.scene.add(this.planetGroup);
+
+    this.jupiterBackdrop = new THREE.Mesh(
+      new THREE.SphereGeometry(16, 24, 18),
+      this.pipe.wobble(new THREE.MeshStandardMaterial({ map: createPlanetTex("jupiter", this.pipe.renderer), roughness: 0.8 }))
+    );
+    this.jupiterBackdrop.position.set(-24, 8, -46);
+    this.jupiterBackdrop.visible = false;
+    this.scene.add(this.jupiterBackdrop);
+
+    const trajPts: THREE.Vector3[] = [];
+    for (let i = 0; i <= 56; i++) {
+      const a = (i / 56) * Math.PI * 2;
+      trajPts.push(new THREE.Vector3(Math.cos(a) * 14.5, Math.sin(a) * 2.2 - 14.8, Math.sin(a) * 14.5 - 10));
+    }
+    this.trajectoryLine = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(trajPts),
+      new THREE.LineBasicMaterial({ color: 0x33ff66 })
+    );
+    this.trajectoryLine.visible = false;
+    this.scene.add(this.trajectoryLine);
+
+    this.rebuild();
+  }
+
+  rebuild() {
+    if (this.rocketRig) {
+      this.scene.remove(this.rocketRig.rocket);
+      disposeObject3D(this.rocketRig.rocket);
+    }
+    if (this.craftMesh) {
+      this.scene.remove(this.craftMesh);
+      disposeObject3D(this.craftMesh);
+    }
+
+    const v = getVehicle(), b = getBus(), instIds = getInstruments().map(i => i.id), m = getMission();
+    this.configSignature = missionManager.getConfigSignature();
+
+    this.rocketRig = buildRocket3D(v.id, this.pipe, m.id);
+    this.scene.add(this.rocketRig.rocket);
+    this.craftMesh = buildSpacecraft3D(b.id, instIds, this.pipe);
+    this.craftMesh.visible = false;
+    this.scene.add(this.craftMesh);
+
+    const pMat = this.planet.material as THREE.MeshStandardMaterial;
+    if (pMat.map) pMat.map.dispose();
+    pMat.map = createPlanetTex(m.id, this.pipe.renderer);
+    pMat.needsUpdate = true;
+
+    const haloColors: Record<string, number> = {
+      m1_cml1: 0x38bdf8, m2_cml2: 0x94a3b8, m3_cml3: 0xf59e0b, m4_cml4: 0x818cf8,
+      m5_mars: 0xfb923c, m6_europa: 0x7dd3fc, m7_dart: 0xa8a29e, m8_cassini: 0xf59e0b,
+      m9_parker: 0xf97316, m10_gateway: 0x94a3b8, m11_juno: 0xfbbf24, m12_roman: 0xc084fc,
+      m13_dragonfly: 0xfb923c, m14_voyager: 0x38bdf8, m15_marsbase: 0xfb923c
+    };
+    const hMat = this.planetHalo.material as THREE.MeshBasicMaterial;
+    hMat.color.setHex(haloColors[m.id] || 0x38bdf8);
+    hMat.opacity = m.id === "m2_cml2" || m.id === "m7_dart" || m.id === "m10_gateway" ? 0.06 : 0.22;
+    this._isEuropa = m.id === "m6_europa";
+    this._isEarthMission = m.id === "m1_cml1";
+
+    this.resetPad();
+  }
+
+  resetPad() {
+    this.accumulator = 0;
+    this.ascentPhysicsSnapshot = null;
+    const gInit = Number(flightPhysics.gravityG.toFixed(2));
+    this.flight = { phase: "PAD", t: 0, countdown: 3.0, alt: 0, vel: 0, g: gInit, fuel: 100, rocketY: 0, sepDone: false, bonusPct: 0 };
+    this.padGroup.visible = true;
+    for (const arm of this.umbilicalArms) arm.rotation.y = 0;
+    if (this.rocketRig) {
+      this.rocketRig.rocket.visible = true;
+      this.rocketRig.rocket.position.set(0, 0, 0);
+      this.rocketRig.rocket.rotation.set(0, 0, 0);
+      this.rocketRig.core.visible = true;
+      this.rocketRig.core.position.set(0, 0, 0);
+      this.rocketRig.core.rotation.set(0, 0, 0);
+    }
+    if (this.craftMesh) this.craftMesh.visible = false;
+    this.plume.visible = false;
+    this.earthGroup.visible = false;
+    this.planetGroup.visible = false;
+    this.jupiterBackdrop.visible = false;
+    this.trajectoryLine.visible = false;
+    this.starsMat.uniforms.uOpacity.value = flightPhysics.atmDensity < 0.15 ? 0.85 : 0;
+    this._skyCur.copy(this._skyAtmosphere).lerp(this._skySpace, Math.max(0, 1 - flightPhysics.atmDensity));
+    (this.scene.background as THREE.Color).copy(this._skyCur);
+    if (this.scene.fog instanceof THREE.FogExp2) {
+      this.scene.fog.color.copy(this._skyCur);
+      this.scene.fog.density = 0.011 * flightPhysics.atmDensity;
+    }
+    for (const p of this.padParticles) p.mesh.visible = true;
+  }
+
+  updatePadParticles(dt: number, mode: string) {
+    const intense = mode === "COUNTDOWN" || mode === "LIFTOFF";
+    for (const p of this.padParticles) {
+      p.mesh.visible = true;
+      p.life += dt * (p.isSpark ? (intense ? 2.5 : 1.2) : (intense ? 1.45 : 0.58));
+      if (p.life >= 1) {
+        p.life = 0;
+        if (p.isSpark) {
+          p.mesh.position.set((Math.random() - 0.5) * 1.1, 0.15, (Math.random() - 0.5) * 1.1);
+        } else {
+          p.mesh.position.set((Math.random() - 0.5) * 0.9, intense ? 0.25 : 0.8 + Math.random() * 1.4, (Math.random() - 0.5) * 0.9);
+        }
+      }
+      const mult = intense ? 1.85 : 0.65;
+      p.mesh.position.x += p.vx * mult * dt;
+      p.mesh.position.y += p.vy * (intense ? 1.2 : 0.7) * dt;
+      p.mesh.position.z += p.vz * mult * dt;
+      const mat = p.mesh.material as THREE.MeshBasicMaterial;
+      if (p.isSpark) {
+        mat.opacity = (1 - p.life) * (intense ? 1 : 0.55);
+        p.mesh.scale.setScalar(1 - p.life * 0.5);
+      } else {
+        mat.color.setHex(intense && p.life < 0.25 ? 0xfed7aa : 0xe2e8f0);
+        mat.opacity = Math.sin(p.life * Math.PI) * (intense ? 0.52 : 0.28);
+        p.mesh.scale.setScalar(0.9 + p.life * (intense ? 3.2 : 2.1));
+      }
+    }
+  }
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    this.lastFrameTime = performance.now();
+    this.accumulator = 0;
+    this.loop(this.lastFrameTime);
+  }
+
+  stop() {
+    this.active = false;
+    cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+  }
+
+  loop(now = performance.now()) {
+    if (!this.active) return;
+    if (document.hidden) {
+      this.lastFrameTime = now;
+      this.frameId = this.isSoftwareGl
+        ? window.setTimeout(() => this.loop(performance.now()), 120)
+        : requestAnimationFrame((t) => this.loop(t));
+      return;
+    }
+
+    const frameDt = Math.min(0.05, Math.max(0, (now - this.lastFrameTime) / 1000));
+    this.lastFrameTime = now;
+    this.accumulator += frameDt;
+
+    let steps = 0;
+    while (this.accumulator >= this.FIXED_DT && steps < 4) {
+      this.stepPhysics(this.FIXED_DT);
+      this.accumulator -= this.FIXED_DT;
+      steps++;
+    }
+
+    this.pipe.render(this.scene, this.camera);
+    if (this.isSoftwareGl) this.frameId = window.setTimeout(() => this.loop(performance.now()), 80);
+    else this.frameId = requestAnimationFrame((t) => this.loop(t));
+  }
+
+  stepPhysics(dt: number) {
+    this.elapsed += dt;
+    const f = this.flight, el = this.elapsed;
+    this.starsMat.uniforms.uTime.value = el;
+    (this.towerBeacon.material as THREE.MeshBasicMaterial).color.setHex(Math.sin(el * 5) > 0 ? 0xef4444 : 0x7f1d1d);
+
+    if (f.phase === "PAD") {
+      this.updatePadParticles(dt, "PAD");
+      const a = el * 0.32;
+      if (this.cameraMode === 0) { this.camera.position.set(Math.cos(a) * 8.6, 4.4, Math.sin(a) * 8.6); this.camera.lookAt(0, 3.0, 0); }
+      else if (this.cameraMode === 1) { this.camera.position.set(12.2, 6.4, 12.2); this.camera.lookAt(0, 3.2, 0); }
+      else { this.camera.position.set(4.0, 5.2, 4.0); this.camera.lookAt(0, 4.6, 0); }
+      return;
+    }
+    if (f.phase === "COUNTDOWN") {
+      this.updatePadParticles(dt, "COUNTDOWN");
+      const prev = Math.ceil(f.countdown);
+      f.countdown -= dt;
+      const next = Math.ceil(f.countdown);
+      if (next !== prev && next > 0) {
+        audio.countdown(false);
+        this.hooks.appendFlightLog(
+          getLang() === "en" ? `T-${next}... Nominal pressurization.` : `T-${next}... Pressurização nominal.`
+        );
+      }
+      for (let i = 0; i < this.umbilicalArms.length; i++) {
+        const targetAngle = 1.18 + i * 0.08;
+        this.umbilicalArms[i].rotation.y = THREE.MathUtils.damp(this.umbilicalArms[i].rotation.y, targetAngle, 2.8 + i * 0.4, dt);
+      }
+      this.camera.position.set(7.8 + Math.sin(el * 22) * 0.035, 3.4, 7.8);
+      this.camera.lookAt(0, 2.8, 0);
+      if (f.countdown <= 0) {
+        f.phase = "ASCENT";
+        f.t = 0;
+        this.ascentPhysicsSnapshot = computeFlightPhysics();
+        this.plume.visible = true;
+        audio.countdown(true);
+        audio.rumble(1.0);
+        this.hooks.appendFlightLog(
+          getLang() === "en" ? "IGNITION! Liftoff confirmed." : "IGNIÇÃO! Decolagem confirmada."
+        );
+        this.hooks.startMissionMinigame();
+        this.hooks.updateLaunchControlsUI();
+      }
+      return;
+    }
+    if (f.phase === "ASCENT") {
+      const phys = this.ascentPhysicsSnapshot || (this.ascentPhysicsSnapshot = computeFlightPhysics());
+      f.t += dt;
+      f.fuel = Math.max(0, 100 - f.t * 7.2 * phys.fuelBurnMult);
+      f.alt += (0.9 + f.t * 2.0 * phys.accelFactor) * dt * 3.5;
+      f.vel = Math.min(12.4, f.t * 0.72 * phys.accelFactor);
+      f.g = f.sepDone ? (1.4 * phys.accelFactor + flightPhysics.gravityG * 0.4) : (flightPhysics.gravityG + f.t * 0.24 * phys.accelFactor);
+
+      const sf = THREE.MathUtils.clamp(f.alt / 105 + Math.max(0, 1 - flightPhysics.atmDensity) * 0.55, 0, 1);
+      this._skyCur.copy(this._skyAtmosphere).lerp(this._skySpace, sf);
+      (this.scene.background as THREE.Color).copy(this._skyCur);
+      if (this.scene.fog instanceof THREE.FogExp2) {
+        this.scene.fog.color.copy(this._skyCur);
+        this.scene.fog.density = 0.011 * flightPhysics.atmDensity * (1 - sf);
+      }
+      this.starsMat.uniforms.uOpacity.value = Math.pow(sf, 0.85);
+
+      f.rocketY += (2.6 + f.t * 2.1 * phys.accelFactor) * dt;
+      if (this.rocketRig) {
+        this.rocketRig.rocket.position.y = f.rocketY;
+        this.rocketRig.rocket.rotation.z = -0.1 * sf;
+        this.plume.position.copy(this.rocketRig.rocket.position);
+      }
+
+      if (f.t < 2.6) {
+        this.updatePadParticles(dt, "LIFTOFF");
+      } else {
+        for (const p of this.padParticles) p.mesh.visible = false;
+      }
+      if (f.rocketY > 38) this.padGroup.visible = false;
+
+      if (sf > 0.35) {
+        this.earthGroup.visible = true;
+        this.earthGroup.position.set(4, f.rocketY - 26.5, -18);
+        this.earthMesh.rotation.y += dt * 0.03;
+      }
+
+      const thrustScale = flightPhysics.throttlePct / 100;
+      const fl = (0.96 + Math.sin(el * 42) * 0.14 + Math.cos(el * 67) * 0.08) * thrustScale;
+      this.flameOuter.scale.set(thrustScale, fl, thrustScale);
+      this.flameInner.scale.set(thrustScale, fl * 1.1, thrustScale);
+      this.flameOuter.position.y = f.sepDone ? 2.4 : -1.35;
+      this.flameInner.position.y = f.sepDone ? 2.9 : -0.9;
+
+      if (!f.sepDone && f.t >= 6.0) {
+        f.sepDone = true;
+        audio.rumble(0.25);
+        this.hooks.appendFlightLog(
+          getLang() === "en"
+            ? "1st stage separation (MECO) complete."
+            : "Separação de 1º estágio (MECO) concluída."
+        );
+      }
+      if (f.sepDone && this.rocketRig) {
+        this.rocketRig.core.position.y -= 10 * dt;
+        this.rocketRig.core.rotation.z += 0.8 * dt;
+        if (this.rocketRig.core.position.y < -24) this.rocketRig.core.visible = false;
+      }
+
+      const d = this.cameraMode === 1 ? 11.5 : this.cameraMode === 2 ? 5.2 : 8.2;
+      const sk = (f.sepDone ? 0.03 : 0.06) * (0.7 + phys.maxQStress * 0.5);
+      this.camera.position.set(d * 0.75 + Math.sin(el * 49) * sk, f.rocketY + 2.8 + Math.cos(el * 37) * sk * 0.5, d * 0.75);
+      this.camera.lookAt(0, f.rocketY + 3.0, 0);
+
+      this.hooks.updateMissionMinigame(dt);
+
+      if (f.t >= 12.5) {
+        this.hooks.finishMissionMinigameAndEvaluate();
+      }
+      return;
+    }
+    if (f.phase === "ORBIT") {
+      f.t += dt;
+      if (this.craftMesh) this.craftMesh.rotation.y += dt * 0.45;
+      this.planet.rotation.y += dt * 0.045;
+      this.earthMesh.rotation.y += dt * 0.025;
+      this.jupiterBackdrop.rotation.y += dt * 0.02;
+      const a = f.t * 0.32, r = this.cameraMode === 2 ? 2.7 : 4.6;
+      this.camera.position.set(Math.cos(a) * r, 1.5, Math.sin(a) * r);
+      this.camera.lookAt(0, -0.4, 0);
+    }
+  }
+
+  enterOrbit() {
+    this.flight.phase = "ORBIT";
+    this.plume.visible = false;
+    if (this.rocketRig) this.rocketRig.rocket.visible = false;
+    this.padGroup.visible = false;
+    for (const p of this.padParticles) p.mesh.visible = false;
+    if (this.craftMesh) {
+      this.craftMesh.visible = true;
+      this.craftMesh.position.set(0, 0.25, 0);
+    }
+    this.planetGroup.visible = true;
+    this.planetGroup.position.set(0, -14.8, -10);
+    if (this._isEarthMission) {
+      this.earthGroup.visible = false;
+    } else {
+      this.earthGroup.visible = true;
+      this.earthGroup.position.set(28, 11, -54);
+    }
+    this.jupiterBackdrop.visible = Boolean(this._isEuropa);
+    this.trajectoryLine.visible = true;
+    this.starsMat.uniforms.uOpacity.value = 1;
+    (this.scene.background as THREE.Color).copy(this._skySpace);
+    if (this.scene.fog instanceof THREE.FogExp2) this.scene.fog.density = 0;
+  }
+
+  fail() {
+    this.flight.phase = "FAILED";
+    this.plume.visible = false;
+  }
+
+  dispose() {
+    this.stop();
+    disposeObject3D(this.scene);
+    this.pipe.dispose();
+  }
+}
+
+export class TelemetryTrophyRenderer {
+  isSoftwareGl: boolean;
+  pipe: TelemetryShaderPipeline;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  model: THREE.Group | null = null;
+  active = false;
+  frameId = 0;
+  lastFrameTime = 0;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.isSoftwareGl = detectSoftwareWebGL();
+    this.pipe = new TelemetryShaderPipeline(canvas);
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x070a12);
+    this.camera = new THREE.PerspectiveCamera(45, 320 / 240, 0.1, 50);
+    this.camera.position.set(0, 1.4, 3.9);
+    this.camera.lookAt(0, 0.2, 0);
+
+    this.scene.add(new THREE.HemisphereLight(0xe0f2fe, 0x1e293b, 1.0));
+    const key = new THREE.DirectionalLight(0xfef3c7, 1.6); key.position.set(3, 5, 4);
+    this.scene.add(key);
+
+    const ped = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.9, 1.05, 0.25, 8),
+      this.pipe.wobble(new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.4, metalness: 0.7, flatShading: true }))
+    );
+    ped.position.y = -0.85;
+    this.scene.add(ped);
+
+    this.setTrophy("m1_cml1");
+  }
+
+  setTrophy(missionId: string) {
+    if (this.model) {
+      this.scene.remove(this.model);
+      disposeObject3D(this.model);
+      this.model = null;
+    }
+    const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => this.pipe.wobble(m);
+    const gold = w(new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.28, metalness: 0.85, flatShading: true }));
+    const silver = w(new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.32, metalness: 0.82, flatShading: true }));
+    const dark = w(new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.65, metalness: 0.35, flatShading: true }));
+    const solar = w(new THREE.MeshStandardMaterial({ color: 0x1d4ed8, roughness: 0.25, metalness: 0.55, flatShading: true }));
+    const white = w(new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.45, metalness: 0.2, flatShading: true }));
+    const rock = w(new THREE.MeshStandardMaterial({ color: 0x78716c, roughness: 0.88, metalness: 0.08, flatShading: true }));
+    const orange = w(new THREE.MeshStandardMaterial({ color: 0xea580c, roughness: 0.55, metalness: 0.25, flatShading: true }));
+
+    if (missionId === "m1_cml1") {
+      this.model = buildSpacecraft3D("bus_nano", ["inst_rgb"], this.pipe);
+    } else if (missionId === "m2_cml2") {
+      this.model = buildSpacecraft3D("bus_orbiter", ["inst_ir", "inst_rgb"], this.pipe);
+    } else if (missionId === "m3_cml3") {
+      this.model = buildSpacecraft3D("bus_orbiter", ["inst_solar", "inst_ir"], this.pipe);
+    } else if (missionId === "m4_cml4") {
+      this.model = buildSpacecraft3D("bus_deepspace", ["inst_jwst", "inst_ir"], this.pipe);
+      this.model.scale.setScalar(0.75);
+    } else if (missionId === "m5_mars") {
+      this.model = buildSpacecraft3D("bus_orbiter", ["inst_ir", "inst_radar"], this.pipe);
+      const cap = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.35, 8), orange);
+      cap.position.set(0, -0.7, 0);
+      this.model.add(cap);
+      this.model.scale.setScalar(0.84);
+    } else if (missionId === "m6_europa") {
+      this.model = buildSpacecraft3D("bus_deepspace", ["inst_radar", "inst_solar"], this.pipe);
+      this.model.scale.setScalar(0.78);
+    } else if (missionId === "m7_dart") {
+      this.model = buildSpacecraft3D("bus_orbiter", ["inst_rgb", "inst_solar"], this.pipe);
+      const ast = new THREE.Mesh(new THREE.DodecahedronGeometry(0.42, 0), rock);
+      ast.position.set(-1.15, 0.25, 0.45);
+      this.model.add(ast);
+      this.model.scale.setScalar(0.76);
+    } else if (missionId === "m8_cassini") {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.48, 1.0, 8), silver);
+      const hga = new THREE.Mesh(new THREE.ConeGeometry(0.75, 0.28, 12, 1, true), white);
+      hga.rotation.x = Math.PI; hga.position.y = 0.72;
+      const huygens = new THREE.Mesh(new THREE.ConeGeometry(0.48, 0.3, 10), gold);
+      huygens.rotation.z = Math.PI / 2; huygens.position.set(0.55, 0, 0);
+      const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.8, 5), dark);
+      boom.rotation.z = Math.PI / 2; boom.position.set(-0.9, 0.2, 0);
+      const rtg1 = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.55, 6), dark);
+      rtg1.position.set(0, -0.58, 0.4); rtg1.rotation.x = Math.PI / 2;
+      g.add(body, hga, huygens, boom, rtg1);
+      g.scale.setScalar(0.85);
+      this.model = g;
+    } else if (missionId === "m9_parker") {
+      const g = new THREE.Group();
+      const shield = new THREE.Mesh(new THREE.CylinderGeometry(0.95, 0.88, 0.14, 6), dark);
+      shield.position.y = 0.55;
+      const bus = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.44, 0.85, 6), silver);
+      bus.position.y = 0.05;
+      const flare = new THREE.Mesh(new THREE.CylinderGeometry(1.02, 1.02, 0.05, 6), orange);
+      flare.position.y = 0.63;
+      const wingL = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.04, 0.32), solar);
+      wingL.position.set(-0.7, -0.15, 0); wingL.rotation.z = -0.3;
+      const wingR = wingL.clone(); wingR.position.x = 0.7; wingR.rotation.z = 0.3;
+      const tail = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1.1, 5), gold);
+      tail.position.y = -0.75;
+      g.add(shield, flare, bus, wingL, wingR, tail);
+      g.scale.setScalar(0.88);
+      this.model = g;
+    } else if (missionId === "m10_gateway") {
+      const g = new THREE.Group();
+      const ppe = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.32, 0.8, 8), gold);
+      ppe.rotation.z = Math.PI / 2; ppe.position.x = -0.65;
+      const halo = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 0.95, 8), white);
+      halo.rotation.z = Math.PI / 2; halo.position.x = 0.18;
+      const node = new THREE.Mesh(new THREE.SphereGeometry(0.38, 8, 8), silver);
+      node.position.x = 0.85;
+      const orion = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.45, 8), silver);
+      orion.rotation.z = -Math.PI / 2; orion.position.x = 1.32;
+      const s1 = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.04, 2.2), solar);
+      s1.position.set(-0.65, 0, 0);
+      g.add(ppe, halo, node, orion, s1);
+      g.scale.setScalar(0.82);
+      this.model = g;
+    } else if (missionId === "m11_juno") {
+      const g = new THREE.Group();
+      const core = new THREE.Mesh(new THREE.CylinderGeometry(0.44, 0.44, 0.48, 6), gold);
+      const ant = new THREE.Mesh(new THREE.ConeGeometry(0.4, 0.2, 10, 1, true), white);
+      ant.rotation.x = Math.PI; ant.position.y = 0.42;
+      g.add(core, ant);
+      for (let k = 0; k < 3; k++) {
+        const ang = (k / 3) * Math.PI * 2;
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.04, 0.42), solar);
+        wing.position.set(Math.cos(ang) * 1.05, 0, Math.sin(ang) * 1.05);
+        wing.rotation.y = -ang;
+        g.add(wing);
+      }
+      g.scale.setScalar(0.74);
+      this.model = g;
+    } else if (missionId === "m12_roman") {
+      const g = new THREE.Group();
+      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, 1.35, 10), white);
+      const baffle = new THREE.Mesh(new THREE.CylinderGeometry(0.54, 0.48, 0.35, 10), dark);
+      baffle.position.y = 0.72;
+      const rear = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.45, 0.95), gold);
+      rear.position.y = -0.68;
+      const pL = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.04, 0.55), solar);
+      pL.position.set(-0.98, -0.55, 0);
+      const pR = pL.clone(); pR.position.x = 0.98;
+      g.add(barrel, baffle, rear, pL, pR);
+      g.scale.setScalar(0.82);
+      this.model = g;
+    } else if (missionId === "m13_dragonfly") {
+      const g = new THREE.Group();
+      const hull = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.42, 1.15), gold);
+      const dome = new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 6), white);
+      dome.position.set(0, 0.2, 0.3);
+      g.add(hull, dome);
+      for (const [rx, rz] of [[-0.65, -0.55], [0.65, -0.55], [-0.65, 0.55], [0.65, 0.55]]) {
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.06, 0.12), dark);
+        arm.position.set(rx * 0.75, 0.05, rz);
+        const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.2, 6), silver);
+        hub.position.set(rx, 0.14, rz);
+        const rotor = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.02, 0.08), dark);
+        rotor.position.set(rx, 0.25, rz);
+        g.add(arm, hub, rotor);
+      }
+      g.scale.setScalar(0.92);
+      this.model = g;
+    } else if (missionId === "m14_voyager") {
+      const g = new THREE.Group();
+      const dish = new THREE.Mesh(new THREE.ConeGeometry(0.95, 0.32, 14, 1, true), white);
+      dish.rotation.x = Math.PI; dish.position.y = 0.38;
+      const bus = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 0.35, 10), dark);
+      bus.position.y = 0.05;
+      const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.05, 12), gold);
+      disc.rotation.x = Math.PI / 2; disc.position.set(0, 0.05, 0.48);
+      const magBoom = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1.85, 5), silver);
+      magBoom.rotation.z = Math.PI / 2; magBoom.position.set(1.05, -0.1, 0);
+      const rtgBoom = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.95, 6), dark);
+      rtgBoom.rotation.z = Math.PI / 2; rtgBoom.position.set(-0.78, -0.15, 0);
+      g.add(dish, bus, disc, magBoom, rtgBoom);
+      g.scale.setScalar(0.8);
+      this.model = g;
+    } else {
+      const g = new THREE.Group();
+      const mars = new THREE.Mesh(new THREE.SphereGeometry(0.42, 10, 8), orange);
+      mars.position.y = -0.35;
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.08, 6, 16), white);
+      ring.rotation.x = Math.PI / 2; ring.position.y = 0.32;
+      const spine = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 1.5, 8), silver);
+      spine.position.y = 0.32;
+      const rad1 = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.04, 1.85), solar);
+      rad1.position.set(0, 0.32, 0);
+      const beacon = new THREE.Mesh(new THREE.OctahedronGeometry(0.22, 0), gold);
+      beacon.position.y = 1.15;
+      g.add(mars, ring, spine, rad1, beacon);
+      g.scale.setScalar(0.82);
+      this.model = g;
+    }
+
+    this.model.position.y = 0.2;
+    this.scene.add(this.model);
+  }
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    this.lastFrameTime = performance.now();
+    this.loop(this.lastFrameTime);
+  }
+
+  stop() {
+    this.active = false;
+    cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+  }
+
+  loop(now = performance.now()) {
+    if (!this.active) return;
+    if (document.hidden) {
+      this.lastFrameTime = now;
+      this.frameId = this.isSoftwareGl
+        ? window.setTimeout(() => this.loop(performance.now()), 120)
+        : requestAnimationFrame((t) => this.loop(t));
+      return;
+    }
+    const dt = Math.min(0.05, Math.max(0, (now - this.lastFrameTime) / 1000));
+    this.lastFrameTime = now;
+    if (this.model) this.model.rotation.y += dt * 0.85;
+    this.pipe.render(this.scene, this.camera);
+    if (this.isSoftwareGl) this.frameId = window.setTimeout(() => this.loop(performance.now()), 90);
+    else this.frameId = requestAnimationFrame((t) => this.loop(t));
+  }
+
+  dispose() {
+    this.stop();
+    disposeObject3D(this.scene);
+    this.pipe.dispose();
+  }
+}
+
+export class TelemetryWorkbenchPreviewRenderer {
+  isSoftwareGl: boolean;
+  pipe: TelemetryShaderPipeline;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  model: THREE.Group | null = null;
+  pedestalRing: THREE.Mesh;
+  active = false;
+  frameId = 0;
+  lastFrameTime = 0;
+  elapsed = 0;
+  currentKey = "";
+  spinOffset = 0;
+  dragActive = false;
+  lastPointerX = 0;
+  private tmpBox = new THREE.Box3();
+  private tmpSize = new THREE.Vector3();
+  private tmpCenter = new THREE.Vector3();
+  private canvas: HTMLCanvasElement;
+  private cleanupDrag: () => void;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+    this.isSoftwareGl = detectSoftwareWebGL();
+    this.pipe = new TelemetryShaderPipeline(canvas);
+    this.pipe.greenFilterEnabled = true;
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x031108);
+    this.scene.fog = new THREE.FogExp2(0x031108, 0.04);
+
+    this.camera = new THREE.PerspectiveCamera(42, 320 / 240, 0.1, 60);
+    this.camera.position.set(0, 1.35, 4.35);
+    this.camera.lookAt(0, 0.12, 0);
+
+    // Iluminação estilizada de hangar espacial NASA com contraste CRT verde + spot quente
+    this.scene.add(new THREE.HemisphereLight(0xbbf7d0, 0x05200e, 1.05));
+    const hangarSpot = new THREE.DirectionalLight(0xdcfce7, 2.0);
+    hangarSpot.position.set(4, 7, 5);
+    const crtRim = new THREE.DirectionalLight(0x33ff66, 1.45);
+    crtRim.position.set(-5, 3.2, -4);
+    const emeraldFill = new THREE.PointLight(0x34d399, 1.35, 14);
+    emeraldFill.position.set(2.8, 1.6, 3.2);
+    this.scene.add(hangarSpot, crtRim, emeraldFill);
+
+    // Piso e pedestal holográfico do hangar CRT
+    const grid = new THREE.GridHelper(8, 12, 0x22c55e, 0x0b3b18);
+    grid.position.y = -1.25;
+    this.scene.add(grid);
+
+    const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => this.pipe.wobble(m);
+    const basePad = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.18, 1.34, 0.22, 8),
+      w(new THREE.MeshStandardMaterial({ color: 0x0f291a, roughness: 0.45, metalness: 0.72, flatShading: true }))
+    );
+    basePad.position.y = -1.14;
+    this.scene.add(basePad);
+
+    this.pedestalRing = new THREE.Mesh(
+      new THREE.TorusGeometry(1.22, 0.032, 6, 24),
+      new THREE.MeshBasicMaterial({ color: 0x33ff66 })
+    );
+    this.pedestalRing.rotation.x = Math.PI / 2;
+    this.pedestalRing.position.y = -1.02;
+    this.scene.add(this.pedestalRing);
+
+    const onDown = (e: PointerEvent) => {
+      this.dragActive = true;
+      this.lastPointerX = e.clientX;
+    };
+    const onMove = (e: PointerEvent) => {
+      if (!this.dragActive) return;
+      const dx = e.clientX - this.lastPointerX;
+      this.lastPointerX = e.clientX;
+      this.spinOffset += dx * 0.014;
+    };
+    const onUp = () => {
+      this.dragActive = false;
+    };
+    canvas.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    this.cleanupDrag = () => {
+      canvas.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    this.setItem("Launch Segment", "lv_cubesat");
+  }
+
+  private buildInstrumentModel(instId: string): THREE.Group {
+    const g = new THREE.Group();
+    const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => this.pipe.wobble(m);
+    const gold = w(new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.28, metalness: 0.85, flatShading: true }));
+    const silver = w(new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.34, metalness: 0.78, flatShading: true }));
+    const dark = w(new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.58, metalness: 0.42, flatShading: true }));
+    const cyan = w(new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.18, metalness: 0.75, flatShading: true }));
+    const emerald = w(new THREE.MeshStandardMaterial({ color: 0x34d399, roughness: 0.3, metalness: 0.6, flatShading: true }));
+
+    if (instId === "inst_rgb") {
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.72, 0.9), dark);
+      const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.36, 0.65, 10), silver);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.set(0, 0, 0.68);
+      const baffle = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.34, 0.25, 10, 1, true), dark);
+      baffle.rotation.x = Math.PI / 2;
+      baffle.position.set(0, 0, 1.02);
+      const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.08, 10), cyan);
+      lens.rotation.x = Math.PI / 2;
+      lens.position.set(0, 0, 0.98);
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.12, 0.45), gold);
+      rail.position.y = -0.42;
+      g.add(body, barrel, baffle, lens, rail);
+    } else if (instId === "inst_laser") {
+      const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.68, 0.85), silver);
+      const gimbal = new THREE.Mesh(new THREE.SphereGeometry(0.32, 10, 8), gold);
+      gimbal.position.set(0, 0.12, 0.48);
+      const beamTube = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.18, 0.7, 10), dark);
+      beamTube.rotation.x = Math.PI / 2;
+      beamTube.position.set(0, 0.12, 0.75);
+      const emitter = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.08, 10), emerald);
+      emitter.rotation.x = Math.PI / 2;
+      emitter.position.set(0, 0.12, 1.12);
+      const wingL = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.65, 0.08), cyan);
+      wingL.position.set(-0.74, 0.1, 0);
+      const wingR = wingL.clone(); wingR.position.x = 0.74;
+      g.add(chassis, gimbal, beamTube, emitter, wingL, wingR);
+    } else if (instId === "inst_ir") {
+      const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.78, 0.95), silver);
+      const slit = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.36, 0.18), gold);
+      slit.position.set(0, 0.08, 0.52);
+      const optic = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.24, 8), cyan);
+      optic.rotation.x = Math.PI / 2;
+      optic.position.set(0, 0.08, 0.62);
+      for (let i = -2; i <= 2; i++) {
+        const fin = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.68, 0.85), dark);
+        fin.position.set(i * 0.22, 0.48, 0);
+        g.add(fin);
+      }
+      g.add(chassis, slit, optic);
+    } else if (instId === "inst_mass_spec") {
+      const vac = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, 1.15, 10), silver);
+      vac.rotation.z = Math.PI / 2;
+      const flangeL = new THREE.Mesh(new THREE.CylinderGeometry(0.56, 0.56, 0.12, 10), gold);
+      flangeL.rotation.z = Math.PI / 2; flangeL.position.x = -0.52;
+      const flangeR = flangeL.clone(); flangeR.position.x = 0.52;
+      const funnel = new THREE.Mesh(new THREE.ConeGeometry(0.32, 0.45, 8), dark);
+      funnel.rotation.z = -Math.PI / 2; funnel.position.x = 0.82;
+      for (const rz of [-0.24, 0.24]) {
+        const quad = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 1.0, 8), cyan);
+        quad.rotation.z = Math.PI / 2; quad.position.set(0, 0.52, rz);
+        g.add(quad);
+      }
+      g.add(vac, flangeL, flangeR, funnel);
+    } else if (instId === "inst_solar") {
+      const mount = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 0.45, 8), dark);
+      mount.position.set(-0.85, 0, 0);
+      mount.rotation.z = Math.PI / 2;
+      const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 1.85, 6), silver);
+      boom.rotation.z = Math.PI / 2;
+      const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.36, 0), gold);
+      core.position.set(0.85, 0, 0);
+      const ringA = new THREE.Mesh(new THREE.TorusGeometry(0.46, 0.035, 6, 14), cyan);
+      ringA.position.set(0.85, 0, 0);
+      const ringB = ringA.clone();
+      ringB.rotation.y = Math.PI / 2;
+      g.add(mount, boom, core, ringA, ringB);
+    } else if (instId === "inst_jwst") {
+      const shield = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.08, 2.2), silver);
+      shield.position.y = -0.58;
+      const shield2 = new THREE.Mesh(new THREE.BoxGeometry(1.65, 0.06, 2.0), dark);
+      shield2.position.y = -0.48;
+      const mirror = new THREE.Group();
+      mirror.position.set(0, 0.28, -0.1);
+      const hex = new THREE.CylinderGeometry(0.24, 0.24, 0.08, 6);
+      const coords = [
+        [0, 0], [0.44, 0], [-0.44, 0],
+        [0.22, 0.38], [-0.22, 0.38],
+        [0.22, -0.38], [-0.22, -0.38]
+      ];
+      for (const [ox, oy] of coords) {
+        const seg = new THREE.Mesh(hex, gold);
+        seg.rotation.x = Math.PI / 2;
+        seg.position.set(ox, oy, 0);
+        mirror.add(seg);
+      }
+      const secPod = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.14, 0.14, 6), dark);
+      secPod.rotation.x = Math.PI / 2;
+      secPod.position.set(0, 0.28, 0.95);
+      const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 1.15, 5), silver);
+      strut.rotation.x = Math.PI / 2.6;
+      strut.position.set(0, 0.52, 0.45);
+      g.add(shield, shield2, mirror, secPod, strut);
+    } else {
+      // inst_radar (REASON Ice-Penetrating Radar)
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.16, 1.1), dark);
+      const arrayMat = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.18, 0.95), cyan);
+      const feed = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 0.36, 8), gold);
+      feed.position.y = 0.24;
+      const dipole1 = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 2.45, 6), silver);
+      dipole1.rotation.z = Math.PI / 2;
+      dipole1.position.y = 0.12;
+      const dipole2 = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 2.45, 6), emerald);
+      dipole2.rotation.x = Math.PI / 2;
+      dipole2.position.y = 0.12;
+      g.add(frame, arrayMat, feed, dipole1, dipole2);
+    }
+    return g;
+  }
+
+  private buildGroundModel(gsId: string): THREE.Group {
+    const g = new THREE.Group();
+    const w = <T extends THREE.Material & { map?: THREE.Texture | null }>(m: T) => this.pipe.wobble(m);
+    const white = w(new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.45, metalness: 0.25, flatShading: true }));
+    const dark = w(new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.65, metalness: 0.4, flatShading: true }));
+    const cyan = w(new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.25, metalness: 0.7, flatShading: true }));
+    const gold = w(new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.35, metalness: 0.8, flatShading: true }));
+
+    if (gsId === "gs_nen" || gsId === "gs_leo") {
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.68, 0.65, 8), dark);
+      const dome = new THREE.Mesh(new THREE.SphereGeometry(0.58, 10, 8), white);
+      dome.position.y = 0.55;
+      const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.9, 6), cyan);
+      mast.position.set(0.55, 0.35, 0);
+      g.add(base, dome, mast);
+    } else if (gsId === "gs_egs") {
+      const mobileLauncher = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.25, 1.4), dark);
+      mobileLauncher.position.y = -0.5;
+      const tower = new THREE.Mesh(new THREE.BoxGeometry(0.32, 1.75, 0.32), gold);
+      tower.position.set(-0.42, 0.38, 0);
+      const arm1 = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.1, 0.14), white);
+      arm1.position.set(0, 0.72, 0);
+      const arm2 = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.1, 0.14), cyan);
+      arm2.position.set(0, 0.3, 0);
+      const cryoTank = new THREE.Mesh(new THREE.SphereGeometry(0.32, 10, 8), white);
+      cryoTank.position.set(0.48, -0.22, -0.35);
+      g.add(mobileLauncher, tower, arm1, arm2, cryoTank);
+    } else if (gsId === "gs_dsn" || gsId === "gs_dsn_goldstone") {
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.65, 0.65, 8), dark);
+      const yoke = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.45, 0.35), dark);
+      yoke.position.y = 0.45;
+      const dish = new THREE.Mesh(new THREE.ConeGeometry(0.95, 0.38, 12, 1, true), white);
+      dish.rotation.x = -Math.PI * 0.72;
+      dish.position.set(0, 0.75, 0.15);
+      const feed = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.65, 5), gold);
+      feed.rotation.x = Math.PI * 0.28;
+      feed.position.set(0, 0.96, 0.36);
+      g.add(base, yoke, dish, feed);
+    } else {
+      const globe = new THREE.Mesh(new THREE.SphereGeometry(0.68, 12, 10), dark);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.03, 6, 20), cyan);
+      ring.rotation.x = Math.PI / 3;
+      for (const [dx, dy, dz] of [[-0.65, 0.35, 0], [0.65, 0.35, 0], [0, -0.45, 0.62]]) {
+        const d = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.14, 8, 1, true), white);
+        d.position.set(dx, dy, dz);
+        d.lookAt(dx * 2, dy * 2, dz * 2);
+        d.rotateX(Math.PI / 2);
+        g.add(d);
+      }
+      g.add(globe, ring);
+    }
+    return g;
+  }
+
+  private buildMissionStageBackdrop(missionId: string): THREE.Group {
+    const g = new THREE.Group();
+    const wireMat = new THREE.MeshBasicMaterial({ color: 0x33ff66, wireframe: true, transparent: true, opacity: 0.48 });
+    const glowMat = new THREE.MeshBasicMaterial({ color: 0x86efac, transparent: true, opacity: 0.62 });
+
+    if (missionId === "m2_cml2" || missionId === "m10_gateway") {
+      const moonArc = new THREE.Mesh(new THREE.TorusGeometry(1.38, 0.025, 6, 18), glowMat);
+      moonArc.rotation.x = Math.PI / 2.25;
+      moonArc.rotation.y = 0.35;
+      const orb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.2, 0), wireMat);
+      orb.position.set(1.22, -0.42, 0.45);
+      g.add(moonArc, orb);
+    } else if (missionId === "m4_cml4" || missionId === "m12_roman") {
+      const hexFrame = new THREE.Mesh(new THREE.CylinderGeometry(1.36, 1.36, 0.04, 6), wireMat);
+      hexFrame.rotation.x = Math.PI / 2.6;
+      hexFrame.position.y = -0.35;
+      const l2Node = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 0), glowMat);
+      l2Node.position.set(-1.18, 0.65, -0.3);
+      g.add(hexFrame, l2Node);
+    } else if (missionId === "m5_mars" || missionId === "m15_marsbase") {
+      const aeroRing = new THREE.Mesh(new THREE.TorusGeometry(1.34, 0.032, 6, 16), wireMat);
+      aeroRing.rotation.x = Math.PI / 2;
+      aeroRing.position.y = -0.55;
+      const marsOrb = new THREE.Mesh(new THREE.DodecahedronGeometry(0.24, 0), wireMat);
+      marsOrb.position.set(1.18, 0.72, -0.25);
+      g.add(aeroRing, marsOrb);
+    } else if (missionId === "m8_cassini" || missionId === "m13_dragonfly") {
+      const satRing1 = new THREE.Mesh(new THREE.TorusGeometry(1.42, 0.04, 5, 22), wireMat);
+      satRing1.rotation.x = Math.PI / 2.35;
+      satRing1.rotation.z = 0.25;
+      const satRing2 = new THREE.Mesh(new THREE.TorusGeometry(1.26, 0.02, 5, 22), glowMat);
+      satRing2.rotation.x = Math.PI / 2.35;
+      satRing2.rotation.z = 0.25;
+      g.add(satRing1, satRing2);
+    } else if (missionId === "m6_europa" || missionId === "m11_juno") {
+      const fluxRing = new THREE.Mesh(new THREE.TorusKnotGeometry(1.22, 0.022, 24, 6, 2, 3), wireMat);
+      fluxRing.rotation.x = Math.PI / 2;
+      fluxRing.position.y = -0.45;
+      g.add(fluxRing);
+    } else if (missionId === "m7_dart") {
+      const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.24, 0), wireMat);
+      rock.position.set(-1.15, 0.55, 0.35);
+      const vector = new THREE.Mesh(new THREE.TorusGeometry(1.25, 0.02, 5, 16, Math.PI * 1.2), glowMat);
+      vector.rotation.x = Math.PI / 2.4;
+      g.add(rock, vector);
+    } else if (missionId === "m3_cml3" || missionId === "m9_parker") {
+      const coronaA = new THREE.Mesh(new THREE.TorusGeometry(1.36, 0.024, 5, 20), glowMat);
+      coronaA.rotation.x = Math.PI / 2.2;
+      const coronaB = coronaA.clone();
+      coronaB.rotation.y = Math.PI / 3;
+      g.add(coronaA, coronaB);
+    } else if (missionId === "m14_voyager") {
+      const goldDisc = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.04, 12), glowMat);
+      goldDisc.position.set(1.16, 0.55, 0.2);
+      goldDisc.rotation.x = Math.PI / 3;
+      const escapeArc = new THREE.Mesh(new THREE.TorusGeometry(1.42, 0.02, 5, 20, Math.PI * 1.4), wireMat);
+      escapeArc.rotation.x = Math.PI / 2.2;
+      g.add(goldDisc, escapeArc);
+    } else {
+      const leoOrbit = new THREE.Mesh(new THREE.TorusGeometry(1.3, 0.022, 5, 20), wireMat);
+      leoOrbit.rotation.x = Math.PI / 2.25;
+      g.add(leoOrbit);
+    }
+    return g;
+  }
+
+  setItem(kind: string, itemId: string, missionId = "m1_cml1") {
+    const key = `${kind}:${itemId}:${missionId}`;
+    if (this.currentKey === key && this.model) return;
+    this.currentKey = key;
+
+    if (this.model) {
+      this.scene.remove(this.model);
+      disposeObject3D(this.model);
+      this.model = null;
+    }
+
+    let root: THREE.Group;
+    if (kind === "Launch Segment") {
+      root = buildRocket3D(itemId, this.pipe, missionId).rocket;
+    } else if (kind === "Space Bus") {
+      root = buildSpacecraft3D(itemId, [], this.pipe);
+    } else if (kind === "Instrumento") {
+      root = this.buildInstrumentModel(itemId);
+    } else {
+      root = this.buildGroundModel(itemId);
+    }
+
+    // Auto-centraliza e normaliza escala para caber perfeitamente no visor do hangar 3D
+    this.tmpBox.setFromObject(root);
+    this.tmpBox.getSize(this.tmpSize);
+    this.tmpBox.getCenter(this.tmpCenter);
+
+    const maxDim = Math.max(this.tmpSize.x, this.tmpSize.y, this.tmpSize.z, 0.1);
+    const targetSpan = kind === "Launch Segment" ? 2.3 : 2.0;
+    const scale = targetSpan / maxDim;
+
+    const pivot = new THREE.Group();
+    root.scale.setScalar(scale);
+    root.position.set(-this.tmpCenter.x * scale, -this.tmpCenter.y * scale, -this.tmpCenter.z * scale);
+    pivot.add(root);
+    pivot.add(this.buildMissionStageBackdrop(missionId));
+
+    // Leve inclinação artística para destacar silhueta 3D
+    if (kind === "Launch Segment") {
+      pivot.position.y = 0.25;
+      pivot.rotation.z = 0.08;
+    } else if (kind === "Ground Segment") {
+      pivot.position.y = -0.12;
+    } else {
+      pivot.position.y = 0.15;
+      pivot.rotation.x = 0.14;
+    }
+
+    this.model = pivot;
+    this.scene.add(this.model);
+  }
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    this.lastFrameTime = performance.now();
+    this.loop(this.lastFrameTime);
+  }
+
+  stop() {
+    this.active = false;
+    cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+  }
+
+  loop(now = performance.now()) {
+    if (!this.active) return;
+    if (document.hidden) {
+      this.lastFrameTime = now;
+      this.frameId = this.isSoftwareGl
+        ? window.setTimeout(() => this.loop(performance.now()), 120)
+        : requestAnimationFrame((t) => this.loop(t));
+      return;
+    }
+    const dt = Math.min(0.05, Math.max(0, (now - this.lastFrameTime) / 1000));
+    this.lastFrameTime = now;
+    this.elapsed += dt;
+
+    if (this.model) {
+      this.model.rotation.y = this.elapsed * 0.72 + this.spinOffset;
+    }
+    const ringMat = this.pedestalRing.material as THREE.MeshBasicMaterial;
+    const pulse = 0.65 + 0.35 * Math.sin(this.elapsed * 3.0);
+    ringMat.color.setRGB(0.1 * pulse, 0.85 * pulse + 0.15, 0.35 * pulse);
+
+    this.pipe.render(this.scene, this.camera);
+    if (this.isSoftwareGl) this.frameId = window.setTimeout(() => this.loop(performance.now()), 90);
+    else this.frameId = requestAnimationFrame((t) => this.loop(t));
+  }
+
+  dispose() {
+    this.stop();
+    this.cleanupDrag();
+    disposeObject3D(this.scene);
+    this.pipe.dispose();
+  }
+}
+
